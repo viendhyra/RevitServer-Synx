@@ -118,6 +118,72 @@ function Get-SynxModelLocationMap {
     $result
 }
 
+function Split-SynxHostNode {
+    param([Parameter(Mandatory)][string]$HostNode)
+    $value=$HostNode.Trim();$address=$value;$port=''
+    if($value-match'^\[(?<address>[^\]]+)\](?::(?<port>\d+))?$'){$address=$matches.address;$port=$matches.port}
+    elseif($value-match'^(?<address>[^:]+):(?<port>\d+)$'){$address=$matches.address;$port=$matches.port}
+    [pscustomobject]@{Address=$address.Trim().Trim('[',']');Port=$port;Endpoint=$value}
+}
+
+function Get-SynxHostAddressSummary {
+    param([Parameter(Mandatory)]$Instance)
+    if(-not(Test-Path -LiteralPath $Instance.HostDatabase -PathType Leaf)){return @()}
+    $groups=@{}
+    foreach($row in @(Invoke-SynxSqliteQuery $Instance.HostDatabase 'SELECT lower(ModelIdentityGUID) AS Guid, HostNode FROM HostNodeForCachedModels ORDER BY ModelIdentityGUID;')){
+        $node=Split-SynxHostNode ([string]$row.HostNode);$key=$node.Address.ToLowerInvariant()
+        if(-not$groups.ContainsKey($key)){$groups[$key]=[ordered]@{Address=$node.Address;Ports=New-Object Collections.ArrayList;Models=New-Object Collections.ArrayList}}
+        if($node.Port-and($groups[$key].Ports-notcontains$node.Port)){[void]$groups[$key].Ports.Add($node.Port)}
+        [void]$groups[$key].Models.Add([pscustomobject]@{Guid=[string]$row.Guid;HostNode=[string]$row.HostNode;Port=$node.Port})
+    }
+    foreach($group in $groups.Values){[pscustomobject]@{Address=$group.Address;Ports=(@($group.Ports|Sort-Object)-join', ');ModelCount=$group.Models.Count;Models=@($group.Models);Display="$($group.Address) — моделей: $($group.Models.Count), порты: $(@($group.Ports|Sort-Object)-join', ')"}}
+}
+
+function Test-SynxHostEndpoint {
+    param([Parameter(Mandatory)][string]$Address,[string[]]$Ports=@('36942','36943'),[ValidateRange(100,10000)][int]$TimeoutMs=1500)
+    $hostName=$Address.Trim().Trim('[',']');if((-not$hostName)-or$hostName-match'(?i)^https?://|[\\/]'){throw 'Введите только DNS-имя или IP-адрес без http:// и пути.'}
+    $resolved=$false;$resolvedAddresses=@();$resolveError=''
+    try{$resolvedAddresses=@([Net.Dns]::GetHostAddresses($hostName)|ForEach-Object{$_.IPAddressToString});$resolved=$resolvedAddresses.Count-gt0}catch{$resolveError=$_.Exception.Message}
+    $checks=New-Object Collections.ArrayList
+    foreach($portText in @($Ports|Where-Object{$_}|Sort-Object -Unique)){
+        $open=$false;$errorText='';$client=New-Object Net.Sockets.TcpClient
+        try{$task=$client.ConnectAsync($hostName,[int]$portText);if($task.Wait($TimeoutMs)){$open=$client.Connected}else{$errorText='timeout'}}catch{$errorText=$_.Exception.GetBaseException().Message}finally{$client.Close()}
+        [void]$checks.Add([pscustomobject]@{Port=[int]$portText;Open=$open;Error=$errorText})
+    }
+    [pscustomobject]@{Address=$hostName;Resolved=$resolved;ResolvedAddresses=$resolvedAddresses;ResolveError=$resolveError;Checks=@($checks);AllPortsOpen=[bool]($checks.Count-gt0-and@($checks|Where-Object{-not$_.Open}).Count-eq0)}
+}
+
+function Import-SynxHostModelNames {
+    param([Parameter(Mandatory)]$Instance,[Parameter(Mandatory)][string]$HostAddress)
+    $hostName=$HostAddress.Trim().Trim('[',']');if((-not$hostName)-or$hostName-match'(?i)^https?://|[\\/]'){throw 'Введите только DNS-имя или IP-адрес Host.'}
+    $remote="\\$hostName\c$\ProgramData\Autodesk\Revit Server $($Instance.Year)\Projects\ModelLocationTable.db3"
+    if(-not(Test-Path -LiteralPath $remote -PathType Leaf)){throw "База имён недоступна по административному ресурсу: $remote. Укажите её кнопкой «База имён…»."}
+    $folder=Join-Path (Join-Path $Instance.Root 'SynxBackup') 'NameSources';if(-not(Test-Path -LiteralPath $folder)){New-Item -ItemType Directory -Path $folder -Force|Out-Null}
+    $safe=($hostName-replace'[^a-zA-Z0-9_.-]','_');$local=Join-Path $folder "ModelLocationTable_${safe}_$(Get-Date -Format yyyy-MM-dd_HHmmss).db3"
+    Copy-Item -LiteralPath $remote -Destination $local -Force
+    if((Get-SynxSqliteIntegrity $local)-ne'ok'){Remove-Item -LiteralPath $local -Force -ErrorAction SilentlyContinue;throw 'Полученная ModelLocationTable.db3 не прошла проверку целостности.'}
+    $local
+}
+
+function Test-SynxCacheFiles {
+    param([Parameter(Mandatory)][string]$CachePath,[string]$ReportDirectory)
+    if(-not(Test-Path -LiteralPath $CachePath -PathType Container)){throw "Каталог кэша не найден: $CachePath"}
+    $issues=New-Object Collections.ArrayList;$count=0;$bytes=[int64]0
+    foreach($file in @(Get-ChildItem -LiteralPath $CachePath -File -Recurse -Force -ErrorAction SilentlyContinue)){
+        $count++;$bytes+=[int64]$file.Length;$kind='';$details=''
+        if($file.Length-eq0){$kind='ZeroLength';$details='Файл нулевой длины'}
+        try{$stream=New-Object IO.FileStream($file.FullName,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete);try{if($file.Length-gt0){[void]$stream.ReadByte()}}finally{$stream.Dispose()}}catch{$kind='Unreadable';$details=$_.Exception.Message}
+        if($kind){[void]$issues.Add([pscustomobject]@{Type=$kind;Path=$file.FullName;Length=$file.Length;LastWriteTime=$file.LastWriteTime;Details=$details})}
+    }
+    $report=''
+    if($ReportDirectory){
+        if(-not(Test-Path -LiteralPath $ReportDirectory)){New-Item -ItemType Directory -Path $ReportDirectory -Force|Out-Null}
+        $report=Join-Path $ReportDirectory ('CacheInspection_'+(Split-Path $CachePath -Leaf)+'_'+(Get-Date -Format yyyy-MM-dd_HHmmss)+'.json')
+        [ordered]@{Created=(Get-Date).ToString('o');CachePath=$CachePath;FileCount=$count;TotalBytes=$bytes;IssueCount=$issues.Count;Issues=@($issues)}|ConvertTo-Json -Depth 6|Set-Content -LiteralPath $report -Encoding UTF8
+    }
+    [pscustomobject]@{CachePath=$CachePath;FileCount=$count;TotalBytes=$bytes;IssueCount=$issues.Count;Issues=@($issues);ReportPath=$report}
+}
+
 function Get-SynxHistoryPath {
     param([Parameter(Mandatory)][string]$InstanceRoot)
     Join-Path (Join-Path $InstanceRoot 'SynxBackup') 'SynxIncidentHistory.jsonl'
@@ -138,7 +204,7 @@ function Read-SynxIncidentHistory {
 function Write-SynxIncidentHistory {
     param(
         [Parameter(Mandatory)][string]$InstanceRoot,
-        [Parameter(Mandatory)][ValidateSet('FailureDetected','RepairSuccess','RepairFailed')][string]$Type,
+        [Parameter(Mandatory)][ValidateSet('FailureDetected','RepairSuccess','RepairFailed','HostAddressMigration','HostAddressMigrationFailed')][string]$Type,
         [Parameter(Mandatory)][string]$Guid,
         [string]$Name='',
         [string]$ModelPath='',
@@ -161,7 +227,7 @@ function Get-SynxLatestRepairTime {
     param([object[]]$History,[Parameter(Mandatory)][string]$Guid)
     $latest=$null
     foreach($record in @($History)){
-        if(($null-eq$record) -or ([string]$record.Guid -ne $Guid) -or ([string]$record.Type -ne 'RepairSuccess')){continue}
+        if(($null-eq$record) -or ([string]$record.Guid -ne $Guid) -or ([string]$record.Type -notin @('RepairSuccess','HostAddressMigration'))){continue}
         try{$time=[datetime]$record.RecordedAt;if(($null-eq$latest) -or ($time-gt$latest)){$latest=$time}}catch{}
     }
     $latest
@@ -214,7 +280,7 @@ function Get-AcceleratorInventory {
         }
     }
     foreach($item in @($items)){
-        $guidHistory=@($history|Where-Object{[string]$_.Guid -eq [string]$item.Guid});$repairs=@($guidHistory|Where-Object Type -eq 'RepairSuccess')
+        $guidHistory=@($history|Where-Object{[string]$_.Guid -eq [string]$item.Guid});$repairs=@($guidHistory|Where-Object{$_.Type-in @('RepairSuccess','HostAddressMigration')})
         if($item.Status -in @('ЗАВИСАНИЕ','ОШИБКА')){
             $startText=if($item.EpisodeStart){([datetime]$item.EpisodeStart).ToString('o')}elseif($item.LastEvent){([datetime]$item.LastEvent).ToString('o')}else{'unknown'}
             $episodeKey="$($item.Guid)|$startText"
@@ -412,4 +478,102 @@ function Invoke-AcceleratorModelRepair {
     }
 }
 
-Export-ModuleMember -Function Initialize-SynxSqlite,Invoke-SynxSqliteQuery,Invoke-SynxSqliteExecute,Get-SynxSqliteIntegrity,ConvertFrom-AutoSyncLogLine,Get-AutoSyncLogAnalysis,Find-AutoSyncLogs,Get-RevitAcceleratorInstances,ConvertFrom-SynxGuidHex,Get-SynxModelLocationMap,Get-SynxHistoryPath,Read-SynxIncidentHistory,Write-SynxIncidentHistory,Get-SynxLatestRepairTime,Get-SynxModelEventState,Get-AcceleratorInventory,Test-SynxAdministrator,ConvertTo-SynxAppPoolState,Get-SynxWebAppPoolState,Get-AcceleratorRepairTargets,New-AcceleratorRepairPreview,Stop-SynxLingeringPoolWorkers,Set-SynxCacheRepairAccess,Move-SynxCacheDirectory,Invoke-AcceleratorModelRepair
+function Invoke-SynxHostAddressMigration {
+    [CmdletBinding(SupportsShouldProcess=$true,ConfirmImpact='High')]
+    param(
+        [Parameter(Mandatory)]$Instance,
+        [Parameter(Mandatory)][string]$OldAddress,
+        [Parameter(Mandatory)][string]$NewAddress,
+        [object[]]$Models=@(),
+        [scriptblock]$ProgressCallback
+    )
+    function Publish-MigrationProgress([int]$Percent,[string]$Message){if($ProgressCallback){&$ProgressCallback $Percent $Message}}
+    function Get-Endpoint([string]$Address,[string]$Port){if($Address.Contains(':')){$base='['+$Address.Trim('[',']')+']'}else{$base=$Address};if($Port){$base+':'+$Port}else{$base}}
+    function Quote-Sql([string]$Text){"'"+($Text-replace"'","''")+"'"}
+
+    Publish-MigrationProgress 2 'Проверка адресов и базы маршрутизации'
+    if(-not(Test-SynxAdministrator)){throw 'Запустите Windows PowerShell от имени администратора.'}
+    $old=$OldAddress.Trim().Trim('[',']');$new=$NewAddress.Trim().Trim('[',']')
+    foreach($value in @($old,$new)){if((-not$value)-or$value-match'(?i)^https?://|[\\/\s]'){throw 'Введите только DNS-имя или IP-адрес без http://, пути и пробелов.'}}
+    if($old-eq$new){throw 'Старый и новый адрес совпадают.'}
+    if(-not(Test-Path -LiteralPath $Instance.HostDatabase -PathType Leaf)){throw 'HostNodeForCachedModels.db3 не найдена.'}
+    if((Get-SynxSqliteIntegrity $Instance.HostDatabase)-ne'ok'){throw 'База HostNodeForCachedModels.db3 не прошла проверку целостности.'}
+
+    $affected=New-Object Collections.ArrayList
+    foreach($row in @(Invoke-SynxSqliteQuery $Instance.HostDatabase 'SELECT lower(ModelIdentityGUID) AS Guid, HostNode FROM HostNodeForCachedModels ORDER BY ModelIdentityGUID;')){
+        $node=Split-SynxHostNode ([string]$row.HostNode)
+        if($node.Address-eq$old){[void]$affected.Add([pscustomobject]@{Guid=([string]$row.Guid).ToLowerInvariant();OldHostNode=[string]$row.HostNode;Port=[string]$node.Port;NewHostNode=(Get-Endpoint $new ([string]$node.Port)})}
+    }
+    if($affected.Count-eq0){throw "В базе нет моделей с адресом $old."}
+    if(-not$PSCmdlet.ShouldProcess("$($affected.Count) GUID: $old -> $new",'Миграция адреса Host и пересоздание затронутых кэшей')){return [pscustomobject]@{Status='Skipped';Message='Отменено'}}
+
+    $stamp=Get-Date -Format yyyy-MM-dd_HHmmss;$safeOld=$old-replace'[^a-zA-Z0-9_.-]','_';$safeNew=$new-replace'[^a-zA-Z0-9_.-]','_'
+    $root=Join-Path (Join-Path $Instance.Root 'SynxBackup') "HostMigration_${safeOld}_to_${safeNew}_$stamp"
+    $backup=Join-Path $root 'DatabaseBackup';$inspection=Join-Path $root 'CacheInspection'
+    $qroot=Join-Path (Join-Path $Instance.Root 'SynxQuarantine') "HostMigration_$stamp"
+    New-Item -ItemType Directory -Path $backup,$inspection,$qroot -Force|Out-Null
+    $targetModel=[pscustomobject]@{Year=$Instance.Year;InstanceRoot=$Instance.Root};$targets=Get-AcceleratorRepairTargets $targetModel
+    if($targets.Services.Count-eq0){throw "Служба Revit Server AutoSync $($Instance.Year) не найдена. Файлы не изменены."}
+    if($targets.Pools.Count-eq0){throw "IIS-пул Revit Server $($Instance.Year) не найден. Файлы не изменены."}
+    $nameMap=@{};foreach($model in @($Models)){if($null-ne$model-and$model.Guid){$nameMap[[string]$model.Guid]=$model}}
+    $moved=New-Object Collections.ArrayList;$databaseChanged=$false
+    $manifest=[ordered]@{Created=(Get-Date);OldAddress=$old;NewAddress=$new;InstanceRoot=$Instance.Root;AffectedModels=@($affected);Services=@($targets.Services|Select-Object Name,DisplayName,State);Pools=@($targets.Pools);Result='Started'}
+    try{
+        Publish-MigrationProgress 8 'Сохранение плана миграции'
+        $manifest|ConvertTo-Json -Depth 7|Set-Content (Join-Path $root 'manifest-before.json') -Encoding UTF8
+        Publish-MigrationProgress 15 'Остановка AutoSync и IIS-пула'
+        Set-SynxRuntimeState $targets Stop
+
+        Publish-MigrationProgress 28 'Создание и проверка бэкапа SQLite-баз'
+        foreach($db in @($Instance.HostDatabase,$Instance.StatusDatabase)){
+            if($db-and(Test-Path -LiteralPath $db -PathType Leaf)){
+                foreach($source in @($db,$db+'-journal',$db+'-wal',$db+'-shm')){
+                    if(-not(Test-Path -LiteralPath $source -PathType Leaf)){continue};$destination=Join-Path $backup ([IO.Path]::GetFileName($source));Copy-Item -LiteralPath $source -Destination $destination -Force
+                    if((Get-Item -LiteralPath $source).Length-ne(Get-Item -LiteralPath $destination).Length){throw "Размер резервной копии не совпадает: $source"}
+                    if((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash-ne(Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash){throw "SHA-256 резервной копии не совпадает: $source"}
+                }
+            }
+        }
+
+        $index=0
+        foreach($item in @($affected)){
+            $index++;$cache=Join-Path $Instance.CachePath $item.Guid;$destination=Join-Path $qroot $item.Guid
+            $basePercent=32+[int](($index-1)*30/[Math]::Max(1,$affected.Count));Publish-MigrationProgress $basePercent "Проверка файлов кэша [$index/$($affected.Count)] $($item.Guid)"
+            if(Test-Path -LiteralPath $cache -PathType Container){[void](Test-SynxCacheFiles -CachePath $cache -ReportDirectory $inspection);if(Move-SynxCacheDirectory -Source $cache -Destination $destination -ProgressCallback $ProgressCallback){[void]$moved.Add([pscustomobject]@{Guid=$item.Guid;Source=$cache;Destination=$destination})}}
+        }
+
+        Publish-MigrationProgress 65 'Транзакционное обновление GUID → HostNode'
+        $statements=New-Object Collections.ArrayList;[void]$statements.Add('BEGIN IMMEDIATE;')
+        foreach($item in @($affected)){[void]$statements.Add("UPDATE HostNodeForCachedModels SET HostNode=$(Quote-Sql $item.NewHostNode) WHERE lower(ModelIdentityGUID)=$(Quote-Sql $item.Guid);")}
+        [void]$statements.Add('COMMIT;');Invoke-SynxSqliteExecute $Instance.HostDatabase ($statements-join[Environment]::NewLine);$databaseChanged=$true
+
+        Publish-MigrationProgress 76 'Проверка новых адресов и целостности базы'
+        $integrity=Get-SynxSqliteIntegrity $Instance.HostDatabase;if($integrity-ne'ok'){throw "Проверка базы: $integrity"}
+        foreach($item in @($affected)){$check=@(Invoke-SynxSqliteQuery $Instance.HostDatabase "SELECT HostNode FROM HostNodeForCachedModels WHERE lower(ModelIdentityGUID)=$(Quote-Sql $item.Guid);")|Select-Object -First 1;if(($null-eq$check)-or([string]$check.HostNode-ne$item.NewHostNode)){throw "Не подтвержден новый HostNode для GUID $($item.Guid)."};if(Test-Path -LiteralPath (Join-Path $Instance.CachePath $item.Guid)){throw "Кэш GUID остался активным: $($item.Guid)"}}
+
+        Publish-MigrationProgress 88 'Запуск IIS-пула и AutoSync'
+        Set-SynxRuntimeState $targets Start
+        $manifest.Result='Changed';$manifest.Completed=Get-Date;$manifest.Quarantine=$qroot;$manifest|ConvertTo-Json -Depth 7|Set-Content (Join-Path $root 'manifest-after.json') -Encoding UTF8
+        foreach($item in @($affected)){$model=if($nameMap.ContainsKey($item.Guid)){$nameMap[$item.Guid]}else{$null};try{[void](Write-SynxIncidentHistory -InstanceRoot $Instance.Root -Type HostAddressMigration -Guid $item.Guid -Name $(if($model){$model.Name}else{'—'}) -ModelPath $(if($model){$model.ModelPath}else{''}) -Status 'HOST_MIGRATED' -ActionRoot $root -Message "$($item.OldHostNode) -> $($item.NewHostNode); кэш отправлен в карантин.")}catch{}}
+        @(
+            "# Запустите от администратора. Сначала остановите AutoSync и IIS-пул Revit Server $($Instance.Year).",
+            "Copy-Item -LiteralPath '$((Join-Path $backup ([IO.Path]::GetFileName([string]$Instance.HostDatabase)).Replace("'","''"))' -Destination '$(([string]$Instance.HostDatabase).Replace("'","''"))' -Force"
+        )|Set-Content (Join-Path $root 'Rollback.ps1') -Encoding UTF8
+        Publish-MigrationProgress 100 "Готово: адрес исправлен для $($affected.Count) моделей"
+        [pscustomobject]@{Status='Changed';OldAddress=$old;NewAddress=$new;AffectedCount=$affected.Count;AffectedModels=@($affected);ActionRoot=$root;BackupPath=$backup;Quarantine=$qroot;Message="Обновлено привязок: $($affected.Count). Кэши отправлены в карантин и будут загружены заново."}
+    }catch{
+        $errorText=$_.Exception.Message
+        try{
+            Publish-MigrationProgress 82 'Ошибка: восстановление баз и кэшей'
+            Set-SynxRuntimeState $targets Stop
+            if($databaseChanged){foreach($db in @($Instance.HostDatabase,$Instance.StatusDatabase)){if(-not$db){continue};foreach($suffix in @('','-journal','-wal','-shm')){$active=$db+$suffix;$copy=Join-Path $backup ([IO.Path]::GetFileName($active));if(Test-Path -LiteralPath $copy -PathType Leaf){Copy-Item -LiteralPath $copy -Destination $active -Force}}}}
+            foreach($item in @($moved|Sort-Object Guid -Descending)){if((Test-Path -LiteralPath $item.Destination -PathType Container)-and(-not(Test-Path -LiteralPath $item.Source))){[IO.Directory]::Move([string]$item.Destination,[string]$item.Source)}}
+            Set-SynxRuntimeState $targets Start;Publish-MigrationProgress 100 'Откат завершён'
+        }catch{$errorText+="; откат: $($_.Exception.Message)"}
+        $manifest.Result='Failed';$manifest.Error=$errorText;$manifest|ConvertTo-Json -Depth 7|Set-Content (Join-Path $root 'manifest-error.json') -Encoding UTF8
+        foreach($item in @($affected)){try{[void](Write-SynxIncidentHistory -InstanceRoot $Instance.Root -Type HostAddressMigrationFailed -Guid $item.Guid -Status 'FAILED' -ActionRoot $root -Message $errorText)}catch{}}
+        throw $errorText
+    }
+}
+
+Export-ModuleMember -Function Initialize-SynxSqlite,Invoke-SynxSqliteQuery,Invoke-SynxSqliteExecute,Get-SynxSqliteIntegrity,ConvertFrom-AutoSyncLogLine,Get-AutoSyncLogAnalysis,Find-AutoSyncLogs,Get-RevitAcceleratorInstances,ConvertFrom-SynxGuidHex,Get-SynxModelLocationMap,Split-SynxHostNode,Get-SynxHostAddressSummary,Test-SynxHostEndpoint,Import-SynxHostModelNames,Test-SynxCacheFiles,Get-SynxHistoryPath,Read-SynxIncidentHistory,Write-SynxIncidentHistory,Get-SynxLatestRepairTime,Get-SynxModelEventState,Get-AcceleratorInventory,Test-SynxAdministrator,ConvertTo-SynxAppPoolState,Get-SynxWebAppPoolState,Get-AcceleratorRepairTargets,New-AcceleratorRepairPreview,Stop-SynxLingeringPoolWorkers,Set-SynxCacheRepairAccess,Move-SynxCacheDirectory,Invoke-AcceleratorModelRepair,Invoke-SynxHostAddressMigration

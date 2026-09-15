@@ -18,7 +18,7 @@ Describe 'GitHub bootstrap' {
     Add-Type -AssemblyName PresentationFramework
     $reader=New-Object Xml.XmlNodeReader $xaml
     $view=[Windows.Markup.XamlReader]::Load($reader)
-    foreach($name in @('ModelsGrid','ErrorsGrid','RepairButton','BatchRepairButton','OpenHistoryButton','RepairProgress','RepairDetails')){
+    foreach($name in @('ModelsGrid','ErrorsGrid','RepairButton','BatchRepairButton','CacheCheckButton','OldHostCombo','NewHostText','TestHostButton','MigrateHostButton','LoadHostNamesButton','OpenHistoryButton','RepairProgress','RepairDetails')){
       $xamlText|Should -Match ('x:Name="'+[regex]::Escape($name)+'"')
       $view.FindName($name)|Should -Not -BeNullOrEmpty
     }
@@ -50,12 +50,30 @@ Describe 'Model name mapping' {
     $map=Get-SynxModelLocationMap @($db);$map['0f671aad-ae8a-452b-8b8d-467ebf402643'].Name|Should -Be 'Named_Model.rvt';$map['0f671aad-ae8a-452b-8b8d-467ebf402643'].ModelPath|Should -Be 'Project\Named_Model.rvt'
   }
 }
+Describe 'Host address migration helpers' {
+  It 'splits IPv4, DNS and bracketed IPv6 endpoints without losing the port' {
+    $a=Split-SynxHostNode '185.77.240.202:36942';$a.Address|Should -Be '185.77.240.202';$a.Port|Should -Be '36942'
+    $b=Split-SynxHostNode 'revit-host.local:36943';$b.Address|Should -Be 'revit-host.local';$b.Port|Should -Be '36943'
+    $c=Split-SynxHostNode '[2001:db8::10]:36942';$c.Address|Should -Be '2001:db8::10';$c.Port|Should -Be '36942'
+  }
+  It 'groups every GUID by the stored Host address and preserves its ports' {
+    $root=Join-Path $TestDrive 'Revit Server 2024';$cache=Join-Path $root 'Cache';New-Item -ItemType Directory -Path $cache -Force|Out-Null;$db=Join-Path $cache 'HostNodeForCachedModels.db3';[IO.File]::WriteAllBytes($db,[byte[]]@())
+    Invoke-SynxSqliteExecute $db "CREATE TABLE HostNodeForCachedModels (ModelIdentityGUID STRING PRIMARY KEY, HostNode STRING); INSERT INTO HostNodeForCachedModels VALUES ('11111111-2222-4333-8444-555555555555','old-host:36942'); INSERT INTO HostNodeForCachedModels VALUES ('aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee','old-host:36943');"
+    $instance=[pscustomobject]@{HostDatabase=$db};$groups=@(Get-SynxHostAddressSummary $instance);$groups.Count|Should -Be 1;$groups[0].ModelCount|Should -Be 2;$groups[0].Ports|Should -Be '36942, 36943'
+  }
+}
 Describe 'Cache quarantine move' {
   It 'moves the selected GUID directory atomically with its Data folder' {
     $source=Join-Path $TestDrive 'Cache\11111111-2222-4333-8444-555555555555';$destination=Join-Path $TestDrive 'SynxQuarantine\11111111-2222-4333-8444-555555555555_test'
     New-Item -ItemType Directory -Path (Join-Path $source 'Data') -Force|Out-Null;Set-Content -LiteralPath (Join-Path $source 'Data\sample.bin') -Value 'test'
     Move-SynxCacheDirectory -Source $source -Destination $destination|Should -BeTrue
     Test-Path -LiteralPath $source|Should -BeFalse;Test-Path -LiteralPath (Join-Path $destination 'Data\sample.bin')|Should -BeTrue
+  }
+}
+Describe 'Cache file inspection' {
+  It 'writes a report and detects a zero-length file' {
+    $cache=Join-Path $TestDrive 'Cache\11111111-2222-4333-8444-555555555555';$reports=Join-Path $TestDrive 'reports';New-Item -ItemType Directory -Path $cache -Force|Out-Null;[IO.File]::WriteAllBytes((Join-Path $cache 'empty.bin'),[byte[]]@())
+    $result=Test-SynxCacheFiles -CachePath $cache -ReportDirectory $reports;$result.FileCount|Should -Be 1;$result.IssueCount|Should -Be 1;Test-Path -LiteralPath $result.ReportPath|Should -BeTrue
   }
 }
 Describe 'AutoSync log parser' {
