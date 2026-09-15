@@ -232,10 +232,10 @@ function Test-SynxModelDiagnostics {
     $lockReport=$null
     if($unreadable.Count){try{Import-Module (Join-Path $PSScriptRoot 'FileLocks.psm1') -Force -ErrorAction Stop;$lockReport=Get-SynxCacheLockReport -CachePath $Model.CachePath -ExpectedAppPool ("RevitServerAppPool$($Model.Year)")}catch{}}
     $zeroFiles=@($cache.Issues|Where-Object{$_.Type-eq'ZeroLength'})
-    $aclRules=if($null-ne$aclInfo-and$aclInfo.PSObject.Properties['Rules']){@($aclInfo.Rules)}else{@()};$serviceAclPattern='(?i)SYSTEM|IIS_IUSRS|IIS AppPool|NETWORK SERVICE'
+    $aclRules=@();if(($null-ne$aclInfo)-and($null-ne$aclInfo.PSObject.Properties['Rules'])){$aclRules=@($aclInfo.Rules)};$serviceAclPattern='(?i)SYSTEM|IIS_IUSRS|IIS AppPool|NETWORK SERVICE'
     $serviceDenies=@($aclRules|Where-Object{$_.Type-eq'Deny'-and$_.Identity-match$serviceAclPattern});$serviceAllows=@($aclRules|Where-Object{$_.Type-eq'Allow'-and$_.Identity-match$serviceAclPattern})
-    $lockedBySecurity=if($null-ne$lockReport){@($lockReport.SecuritySoftware)}else{@()}
-    $lockedByStranger=if($null-ne$lockReport){@($lockReport.Unexpected)}else{@()}
+    $lockedBySecurity=@();$lockedByStranger=@()
+    if($null-ne$lockReport){$lockedBySecurity=@($lockReport.SecuritySoftware);$lockedByStranger=@($lockReport.Unexpected)}
     $reason='Причина не подтверждена';$confidence='Низкая';$action='Сравнить отчёт с исправной моделью и повторить диагностику во время зависания.';$evidence=New-Object Collections.ArrayList
     if($null-ne$hostCheck-and((-not$hostCheck.Resolved)-or(-not$hostCheck.AllPortsOpen))){$reason='Host или порт недоступен';$confidence='Высокая';$action='Исправить DNS/маршрут/порт до очистки кэша.';[void]$evidence.Add("Проверка HostNode неуспешна: $($Model.HostNode)")}
     elseif($lockedBySecurity.Count){$reason='Файлы кэша сканирует защитное ПО';$confidence='Высокая';$action="Добавить исключение на каталог Cache и процессы AutoSync/w3wp в $(@($lockedBySecurity|ForEach-Object{$_.ProcessName})-join', '); очистка кэша эту причину не устраняет.";[void]$evidence.Add("Файлы держат: $(@($lockedBySecurity|ForEach-Object{"$($_.ProcessName) (PID $($_.ProcessId))"})-join', ')")}
@@ -328,7 +328,7 @@ function Get-SynxModelEventState {
     }
     $hangs=@();$errors=@()
     foreach($event in @($current)){if($event.Type-eq'StuckThread'){$hangs+=,$event}elseif($event.Type-eq'Error'){$errors+=,$event}}
-    $last=if($dated.Count){@($dated|Sort-Object Time|Select-Object -Last 1)}else{@()}
+    $last=@();if($dated.Count){$last=@($dated|Sort-Object Time|Select-Object -Last 1)}
     $firstFailure=@(@($hangs)+@($errors)|Where-Object{$_.Time}|Sort-Object Time|Select-Object -First 1)
     [pscustomobject]@{
         Hangs=@($hangs)
@@ -391,14 +391,14 @@ function Get-AcceleratorInventory {
     if(Test-Path -LiteralPath $Instance.StatusDatabase -PathType Leaf){$statusIntegrity=Get-SynxSqliteIntegrity $Instance.StatusDatabase;if($statusIntegrity-eq'ok'){$s=@(Invoke-SynxSqliteQuery $Instance.StatusDatabase 'SELECT CacheStatus FROM CacheStatus LIMIT 1;')|Select-Object -First 1;if($null-ne$s){$cacheStatus=[string]$s.CacheStatus}}}
     $known=@{};$items=New-Object Collections.ArrayList
     foreach($row in $rows){
-        $guid=[string]$row.Guid;$known[$guid]=$true;$me=if($byGuid.ContainsKey($guid)){@($byGuid[$guid])}else{@()};$repairTime=Get-SynxLatestRepairTime -History $history -Guid $guid;$eventState=Get-SynxModelEventState $me -After $repairTime;$hangs=@($eventState.Hangs);$errors=@($eventState.Errors);$last=@($eventState.Last);$first=@($eventState.FirstFailure);$lastTime=if($last.Count){$last[0].Time}else{$null};$firstTime=if($first.Count){$first[0].Time}else{$null};$lastMessage=if($last.Count){[string]$last[0].Raw}else{''};$folder=Join-Path $Instance.CachePath $guid;$location=if($locations.ContainsKey($guid)){$locations[$guid]}else{$null}
+        $guid=[string]$row.Guid;$known[$guid]=$true;$me=@();if($byGuid.ContainsKey($guid)){$me=@($byGuid[$guid])};$repairTime=Get-SynxLatestRepairTime -History $history -Guid $guid;$eventState=Get-SynxModelEventState $me -After $repairTime;$hangs=@($eventState.Hangs);$errors=@($eventState.Errors);$last=@($eventState.Last);$first=@($eventState.FirstFailure);$lastTime=if($last.Count){$last[0].Time}else{$null};$firstTime=if($first.Count){$first[0].Time}else{$null};$lastMessage=if($last.Count){[string]$last[0].Raw}else{''};$folder=Join-Path $Instance.CachePath $guid;$location=if($locations.ContainsKey($guid)){$locations[$guid]}else{$null}
         $status=Get-SynxModelStatus -EventState $eventState -CacheExists ([bool](Test-Path -LiteralPath $folder -PathType Container)) -HasDbRow $true
         [void]$items.Add([pscustomobject]@{Name=if($location){$location.Name}else{'—'};ModelPath=if($location){$location.ModelPath}else{''};Guid=$guid;HostNode=[string]$row.HostNode;Year=$Instance.Year;Status=$status;HangCount=$hangs.Count;ErrorCount=$errors.Count;LastEvent=$lastTime;EpisodeStart=$firstTime;LastMessage=$lastMessage;CacheExists=[bool](Test-Path -LiteralPath $folder -PathType Container);CachePath=$folder;InstanceRoot=$Instance.Root;HostDatabase=$Instance.HostDatabase;StatusDatabase=$Instance.StatusDatabase})
     }
     if(Test-Path -LiteralPath $Instance.CachePath){
         foreach($dir in @(Get-ChildItem -LiteralPath $Instance.CachePath -Directory -ErrorAction SilentlyContinue|Where-Object Name -match '^[0-9a-fA-F-]{36}$')){
             $guid=$dir.Name.ToLowerInvariant();if($known.ContainsKey($guid)){continue}
-            $me=if($byGuid.ContainsKey($guid)){@($byGuid[$guid])}else{@()};$repairTime=Get-SynxLatestRepairTime -History $history -Guid $guid;$eventState=Get-SynxModelEventState $me -After $repairTime;$hangs=@($eventState.Hangs);$errors=@($eventState.Errors);$last=@($eventState.Last);$first=@($eventState.FirstFailure)
+            $me=@();if($byGuid.ContainsKey($guid)){$me=@($byGuid[$guid])};$repairTime=Get-SynxLatestRepairTime -History $history -Guid $guid;$eventState=Get-SynxModelEventState $me -After $repairTime;$hangs=@($eventState.Hangs);$errors=@($eventState.Errors);$last=@($eventState.Last);$first=@($eventState.FirstFailure)
             $status=Get-SynxModelStatus -EventState $eventState -CacheExists $true -HasDbRow $false;$location=if($locations.ContainsKey($guid)){$locations[$guid]}else{$null}
             [void]$items.Add([pscustomobject]@{Name=if($location){$location.Name}else{'—'};ModelPath=if($location){$location.ModelPath}else{''};Guid=$guid;HostNode='';Year=$Instance.Year;Status=$status;HangCount=$hangs.Count;ErrorCount=$errors.Count;LastEvent=if($last.Count){$last[0].Time}else{$null};EpisodeStart=if($first.Count){$first[0].Time}else{$null};LastMessage=if($last.Count){[string]$last[0].Raw}else{''};CacheExists=$true;CachePath=$dir.FullName;InstanceRoot=$Instance.Root;HostDatabase=$Instance.HostDatabase;StatusDatabase=$Instance.StatusDatabase})
         }
