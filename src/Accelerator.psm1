@@ -23,7 +23,8 @@ namespace RevitServerSynx {
     [DllImport("winsqlite3.dll",CallingConvention=CallingConvention.Cdecl)] static extern void sqlite3_free(IntPtr p);
     static IntPtr Utf8(string s){byte[] b=Encoding.UTF8.GetBytes(s+"\0");IntPtr p=Marshal.AllocHGlobal(b.Length);Marshal.Copy(b,0,p,b.Length);return p;}
     static string Text(IntPtr p){if(p==IntPtr.Zero)return null;int n=0;while(Marshal.ReadByte(p,n)!=0)n++;byte[] b=new byte[n];Marshal.Copy(p,b,0,n);return Encoding.UTF8.GetString(b);}
-    static IntPtr Open(string path,int flags){IntPtr db,p=Utf8(path);try{int c=sqlite3_open_v2(p,out db,flags,IntPtr.Zero);if(c!=OK){string m=db==IntPtr.Zero?"open failed":Text(sqlite3_errmsg(db));if(db!=IntPtr.Zero)sqlite3_close(db);throw new InvalidOperationException("SQLite open ("+c+"): "+m);}return db;}finally{Marshal.FreeHGlobal(p);}}
+    [DllImport("winsqlite3.dll",CallingConvention=CallingConvention.Cdecl)] static extern int sqlite3_busy_timeout(IntPtr db,int ms);
+    static IntPtr Open(string path,int flags){IntPtr db,p=Utf8(path);try{int c=sqlite3_open_v2(p,out db,flags,IntPtr.Zero);if(c!=OK){string m=db==IntPtr.Zero?"open failed":Text(sqlite3_errmsg(db));if(db!=IntPtr.Zero)sqlite3_close(db);throw new InvalidOperationException("SQLite open ("+c+"): "+m);}sqlite3_busy_timeout(db,15000);return db;}finally{Marshal.FreeHGlobal(p);}}
     public static List<Dictionary<string,string>> Query(string path,string sql){IntPtr db=Open(path,READONLY),stmt=IntPtr.Zero,p=Utf8(sql);try{int c=sqlite3_prepare_v2(db,p,-1,out stmt,IntPtr.Zero);if(c!=OK)throw new InvalidOperationException("SQLite prepare ("+c+"): "+Text(sqlite3_errmsg(db)));var rows=new List<Dictionary<string,string>>();int n=sqlite3_column_count(stmt);while((c=sqlite3_step(stmt))==ROW){var row=new Dictionary<string,string>(StringComparer.OrdinalIgnoreCase);for(int i=0;i<n;i++)row[Text(sqlite3_column_name(stmt,i))]=Text(sqlite3_column_text(stmt,i));rows.Add(row);}if(c!=DONE)throw new InvalidOperationException("SQLite query ("+c+"): "+Text(sqlite3_errmsg(db)));return rows;}finally{if(stmt!=IntPtr.Zero)sqlite3_finalize(stmt);Marshal.FreeHGlobal(p);sqlite3_close(db);}}
     public static void Execute(string path,string sql){IntPtr db=Open(path,READWRITE),error=IntPtr.Zero,p=Utf8(sql);try{int c=sqlite3_exec(db,p,IntPtr.Zero,IntPtr.Zero,out error);if(c!=OK)throw new InvalidOperationException("SQLite write ("+c+"): "+(error==IntPtr.Zero?Text(sqlite3_errmsg(db)):Text(error)));}finally{if(error!=IntPtr.Zero)sqlite3_free(error);Marshal.FreeHGlobal(p);sqlite3_close(db);}}
   }
@@ -56,22 +57,31 @@ function ConvertFrom-AutoSyncLogLine {
     $time=$null
     if($Line -match '^(?<t>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[,.]\d{3})'){try{$time=[datetime]::ParseExact(($matches.t-replace ',','.'),'yyyy-MM-dd HH:mm:ss.fff',[Globalization.CultureInfo]::InvariantCulture)}catch{}}
     $guid='';$gm=[regex]::Match($Line,'(?i)(?<g>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})');if($gm.Success){$guid=$gm.Groups['g'].Value.ToLowerInvariant()}
-    $type='Info';$level='INFO';$message=$Line;$host='';$loop=0;$threads=0
+    $type='Info';$level='INFO';$message=$Line;$hostNode='';$loop=0;$threads=0
     if($Line -match '(?i)Loop\s+(?<l>\d+)\s*:\s*(?<n>\d+)\s+threads?\s+are\s+still\s+not\s+done\s+for\s+Model'){$type='StuckThread';$level='FAIL';$loop=[int]$matches.l;$threads=[int]$matches.n;$message='Поток AutoSync не завершил обработку кэша модели.'}
-    elseif($Line -match '(?i)Failed to get IP addresses for\s+(?<h>[^ ]+)\s*: No such host'){$type='HostResolution';$level='WARN';$host=$matches.h.TrimEnd(':');$message='Не удалось разрешить адрес HostNode.'}
-    elseif($Line -match '(?i)\b(ERROR|Exception|Failed|FileNotFoundException|EndpointNotFoundException|locked by another process)\b'){$type='Error';$level='FAIL'}
+    elseif($Line -match '(?i)Failed to get IP addresses for\s+(?<h>[^ ]+)\s*: No such host'){$type='HostResolution';$level='WARN';$hostNode=$matches.h.TrimEnd(':');$message='Не удалось разрешить адрес HostNode.'}
+    elseif($Line -match '(?i)(\bERROR\b|Exception|FileNotFoundException|EndpointNotFoundException|locked by another process|Failed to (?!get IP))'){$type='Error';$level='FAIL'}
     elseif($Line -match '(?i)Data is up-to-date with central'){$type='UpToDate';$level='OK';$message='Кэш соответствует центральной модели.'}
-    [pscustomobject]@{Time=$time;Level=$level;Type=$type;Guid=$guid;HostNode=$host;Loop=$loop;Threads=$threads;Message=$message;Raw=$Line}
+    [pscustomobject]@{Time=$time;Level=$level;Type=$type;Guid=$guid;HostNode=$hostNode;Loop=$loop;Threads=$threads;Message=$message;Raw=$Line}
 }
 
 function Get-AutoSyncLogAnalysis {
-    param([string[]]$Paths,[ValidateRange(100,200000)][int]$Tail=30000)
+    param([string[]]$Paths,[ValidateRange(100,200000)][int]$Tail=30000,[bool]$AssociateContext=$true)
     $events=New-Object Collections.ArrayList
     $seen=@{}
     foreach($path in @($Paths)){
         if((-not $path) -or (-not (Test-Path -LiteralPath $path -PathType Leaf)) -or $seen.ContainsKey([string]$path)){continue}
         $seen[[string]$path]=$true
-        try{foreach($line in @(Get-Content -LiteralPath $path -Tail $Tail -ErrorAction Stop)){$event=ConvertFrom-AutoSyncLogLine ([string]$line);if($event.Type-ne'Info'){$event|Add-Member -NotePropertyName LogPath -NotePropertyValue $path;[void]$events.Add($event)}}}catch{[void]$events.Add([pscustomobject]@{Time=Get-Date;Level='FAIL';Type='LogRead';Guid='';HostNode='';Loop=0;Threads=0;Message=$_.Exception.Message;Raw='';LogPath=$path})}
+        $currentGuid=''
+        try{foreach($line in @(Get-Content -LiteralPath $path -Tail $Tail -ErrorAction Stop)){
+            $event=ConvertFrom-AutoSyncLogLine ([string]$line)
+            if($AssociateContext){
+                if($event.Guid){$currentGuid=$event.Guid}
+                elseif($currentGuid -and ($event.Type -in @('UpToDate','Error'))){$event.Guid=$currentGuid}
+                if($event.Type-eq'UpToDate'){$currentGuid=''}
+            }
+            if($event.Type-ne'Info'){$event|Add-Member -NotePropertyName LogPath -NotePropertyValue $path;[void]$events.Add($event)}
+        }}catch{[void]$events.Add([pscustomobject]@{Time=Get-Date;Level='FAIL';Type='LogRead';Guid='';HostNode='';Loop=0;Threads=0;Message=$_.Exception.Message;Raw='';LogPath=$path})}
     };@($events)
 }
 
@@ -219,11 +229,17 @@ function Test-SynxModelDiagnostics {
     $positiveStreamLines=@($context|Where-Object{$_.Text-match'(?i)<[^>]*StreamLength>\s*[1-9]\d*\s*</'})
     $badDatabases=@($cache.DatabaseChecks|Where-Object{$_.Integrity-ne'ok'})
     $unreadable=@($cache.Issues|Where-Object{$_.Type-in @('Unreadable','EnumerationError')})
+    $lockReport=$null
+    if($unreadable.Count){try{Import-Module (Join-Path $PSScriptRoot 'FileLocks.psm1') -Force -ErrorAction Stop;$lockReport=Get-SynxCacheLockReport -CachePath $Model.CachePath -ExpectedAppPool ("RevitServerAppPool$($Model.Year)")}catch{}}
     $zeroFiles=@($cache.Issues|Where-Object{$_.Type-eq'ZeroLength'})
     $aclRules=if($null-ne$aclInfo-and$aclInfo.PSObject.Properties['Rules']){@($aclInfo.Rules)}else{@()};$serviceAclPattern='(?i)SYSTEM|IIS_IUSRS|IIS AppPool|NETWORK SERVICE'
     $serviceDenies=@($aclRules|Where-Object{$_.Type-eq'Deny'-and$_.Identity-match$serviceAclPattern});$serviceAllows=@($aclRules|Where-Object{$_.Type-eq'Allow'-and$_.Identity-match$serviceAclPattern})
+    $lockedBySecurity=if($null-ne$lockReport){@($lockReport.SecuritySoftware)}else{@()}
+    $lockedByStranger=if($null-ne$lockReport){@($lockReport.Unexpected)}else{@()}
     $reason='Причина не подтверждена';$confidence='Низкая';$action='Сравнить отчёт с исправной моделью и повторить диагностику во время зависания.';$evidence=New-Object Collections.ArrayList
     if($null-ne$hostCheck-and((-not$hostCheck.Resolved)-or(-not$hostCheck.AllPortsOpen))){$reason='Host или порт недоступен';$confidence='Высокая';$action='Исправить DNS/маршрут/порт до очистки кэша.';[void]$evidence.Add("Проверка HostNode неуспешна: $($Model.HostNode)")}
+    elseif($lockedBySecurity.Count){$reason='Файлы кэша сканирует защитное ПО';$confidence='Высокая';$action="Добавить исключение на каталог Cache и процессы AutoSync/w3wp в $(@($lockedBySecurity|ForEach-Object{$_.ProcessName})-join', '); очистка кэша эту причину не устраняет.";[void]$evidence.Add("Файлы держат: $(@($lockedBySecurity|ForEach-Object{"$($_.ProcessName) (PID $($_.ProcessId))"})-join', ')")}
+    elseif($lockedByStranger.Count){$reason='Кэш держит посторонний процесс';$confidence='Высокая';$action='Освободить файлы штатной остановкой владельца (tools\Get-SynxFileLock.ps1); ACL не трогать.';[void]$evidence.Add($lockReport.Verdict)}
     elseif($unreadable.Count){$reason='Файлы кэша недоступны для чтения';$confidence='Высокая';$action='После остановки AutoSync/IIS сравнить ACL с исправным GUID и восстановить наследование прав.';[void]$evidence.Add("Недоступных файлов или каталогов: $($unreadable.Count)")}
     elseif($serviceDenies.Count){$reason='ACL запрещает доступ служебной учётной записи';$confidence='Высокая';$action='Сравнить ACL с исправным GUID и убрать только конфликтующее правило Deny после остановки компонентов.';[void]$evidence.Add("Запрещающих правил для SYSTEM/IIS/NETWORK SERVICE: $($serviceDenies.Count)")}
     elseif($aclInfo.PSObject.Properties['InheritanceProtected']-and$aclInfo.InheritanceProtected-and$serviceAllows.Count-eq0){$reason='Кэш не наследует права служб';$confidence='Средняя';$action='После остановки компонентов восстановить наследование ACL выбранного GUID и сравнить с исправным каталогом.';[void]$evidence.Add('Наследование ACL отключено; разрешения SYSTEM/IIS/NETWORK SERVICE не найдены.')}
@@ -234,13 +250,17 @@ function Test-SynxModelDiagnostics {
         else{$reason='Повреждена внутренняя SQLite-база кэша';$confidence='Высокая';$action='Выполнить точечный ремонт всего GUID из резервной копии.'}
         [void]$evidence.Add("SQLite с ошибкой: $(@($badDatabases|ForEach-Object{[IO.Path]::GetFileName($_.Path)})-join', ')")
     }
-    elseif($Model.RepeatFailure){$reason='Сбой повторно приходит после очистки';$confidence='Средняя';$action='Проверить чтение w3wp.exe через Process Monitor; если чтение успешно — пересохранить центральную модель штатно через Revit.';[void]$evidence.Add('Тот же GUID снова завис после успешного локального ремонта.')}
     elseif($zeroStreamLines.Count-and-not$positiveStreamLines.Count){$reason='WCF показывает StreamLength=0';$confidence='Низкая';$action='Сравнить с исправной моделью и проверить реальные ReadFile процесса w3wp.exe; WCF-журнал потоковых сообщений содержит только заголовки.';[void]$evidence.Add("Строк StreamLength=0: $($zeroStreamLines.Count); положительных значений рядом: 0")}
     elseif($Model.Status-eq'ЗАВИСАНИЕ'-and$cache.IdleMinutes-ne$null-and$cache.IdleMinutes-ge2){$reason='AutoSync перестал изменять кэш';$confidence='Средняя';$action='Проверить последний файл и контекст AutoSyncLog; затем определить ReadFile процесса w3wp.exe.';[void]$evidence.Add("Кэш не изменялся $($cache.IdleMinutes) мин.; последний файл: $(if($cache.NewestFiles.Count){$cache.NewestFiles[0].Path}else{'нет'})")}
     elseif($Model.Status-eq'ЗАВИСАНИЕ'){$reason='AutoSync не завершает обработку модели';$confidence='Средняя';$action='Повторить диагностику через 2–3 минуты и проверить последний изменяемый файл.';[void]$evidence.Add("Строк threads are still not done: $($Model.HangCount)")}
+    if($Model.RepeatFailure){
+        [void]$evidence.Add('Тот же GUID снова завис после успешного локального ремонта — очистка кэша причину не устраняет.')
+        if($reason-eq'Причина не подтверждена'){$reason='Сбой повторяется после очистки — причина вне локального кэша';$confidence='Средняя';$action='Проверить по порядку: исключения антивируса на каталог Cache и процессы AutoSync/w3wp; readerQuotas и MaxBytesPerRead на Host; поведение той же модели на другом акселераторе; на каком файле останавливается запись.'}
+        else{if($confidence-eq'Низкая'){$confidence='Средняя'};$action="$action Дополнительно: сбой уже повторялся после очистки — проверьте антивирус и readerQuotas на Host."}
+    }
     if($cache.TransactionSidecars.Count){[void]$evidence.Add("Файлов journal/WAL/SHM: $($cache.TransactionSidecars.Count) (при работающем AutoSync это не обязательно ошибка)")}
     if($zeroStreamLines.Count){[void]$evidence.Add("В контексте WCF есть StreamLength=0: $($zeroStreamLines.Count); само по себе это не доказывает передачу 0 байт")}
-    if($cache.NewestFiles.Count){[void]$evidence.Add("Последним изменён: $($cache.NewestFiles[0].Path), $($cache.NewestFiles[0].LastWriteTime)")}
+    if($cache.NewestFiles.Count){$newestText=if($cache.NewestFiles[0].LastWriteTime){([datetime]$cache.NewestFiles[0].LastWriteTime).ToString('dd.MM.yyyy HH:mm:ss')}else{'—'};[void]$evidence.Add("Последним изменён: $($cache.NewestFiles[0].Path) — $newestText")}
     $recommendations=@($action)
     [ordered]@{Created=(Get-Date).ToString('o');Guid=$Model.Guid;Name=$Model.Name;ModelPath=$Model.ModelPath;HostNode=$Model.HostNode;Status=$Model.Status;RepeatFailure=$Model.RepeatFailure;HangCount=$Model.HangCount;LastMessage=$Model.LastMessage;Diagnosis=[ordered]@{Reason=$reason;Confidence=$confidence;Evidence=@($evidence);Action=$action};HostCheck=$hostCheck;Acl=$aclInfo;Wcf=[ordered]@{ZeroStreamLengthLines=$zeroStreamLines.Count;PositiveStreamLengthLines=$positiveStreamLines.Count};Cache=$cache;LogContext=$context;Recommendations=$recommendations}|ConvertTo-Json -Depth 10|Set-Content -LiteralPath $report -Encoding UTF8
     [pscustomobject]@{Guid=$Model.Guid;Reason=$reason;Confidence=$confidence;Evidence=@($evidence);Action=$action;HostCheck=$hostCheck;Acl=$aclInfo;Cache=$cache;LogContextCount=$context.Count;Recommendations=$recommendations;ReportPath=$report}
@@ -318,6 +338,48 @@ function Get-SynxModelEventState {
     }
 }
 
+function Restore-SynxDatabaseSet {
+    # Восстановление вместе с журнальными файлами. Накат старой .db3 поверх
+    # свежего -wal даёт состояние, которого не было ни до, ни после ремонта.
+    param([Parameter(Mandatory)][string]$BackupDir,[Parameter(Mandatory)][string[]]$Databases)
+    $restored=@()
+    foreach($db in @($Databases)){
+        if(-not$db){continue}
+        $name=[IO.Path]::GetFileName($db);$source=Join-Path $BackupDir $name
+        if(-not(Test-Path -LiteralPath $source -PathType Leaf)){continue}
+        foreach($suffix in @('-wal','-shm','-journal')){
+            $target=$db+$suffix
+            if(Test-Path -LiteralPath $target){Remove-Item -LiteralPath $target -Force}
+            $saved=Join-Path $BackupDir ($name+$suffix)
+            if(Test-Path -LiteralPath $saved){Copy-Item -LiteralPath $saved -Destination $target -Force}
+        }
+        Copy-Item -LiteralPath $source -Destination $db -Force
+        $integrity=Get-SynxSqliteIntegrity $db
+        if($integrity-ne'ok'){throw "Восстановленная база не прошла integrity_check: $name ($integrity)"}
+        $restored+=,$db
+    }
+    @($restored)
+}
+
+function Get-SynxModelStatus {
+    # ЗАВИСАНИЕ только по свежему сбою: последнее событие модели — зависание,
+    # оно моложе окна, и номера циклов AutoSync успели вырасти. Иначе старые
+    # строки в хвосте лога вечно держат здоровую модель в красном статусе.
+    param($EventState,[bool]$CacheExists,[bool]$HasDbRow,[int]$HangWindowMinutes=20,[int]$ErrorWindowHours=2,[int]$MinHangs=3,[int]$MinLoopSpan=2)
+    $hangs=@($EventState.Hangs);$errors=@($EventState.Errors);$last=@($EventState.Last)
+    $lastEvent=if($last.Count){$last[0]}else{$null}
+    $lastTime=if($lastEvent){$lastEvent.Time}else{$null}
+    $hangFresh=[bool]($lastEvent -and $lastTime -and ($lastEvent.Type-eq'StuckThread') -and ([datetime]$lastTime -gt (Get-Date).AddMinutes(-$HangWindowMinutes)))
+    $loops=@(@($hangs)|Where-Object{$_.Loop-gt0}|ForEach-Object{[int]$_.Loop})
+    $loopSpan=0
+    if($loops.Count-ge2){$loopSpan=($loops|Measure-Object -Maximum).Maximum-($loops|Measure-Object -Minimum).Minimum}
+    if(($hangs.Count-ge$MinHangs)-and$hangFresh-and($loopSpan-ge$MinLoopSpan)){return 'ЗАВИСАНИЕ'}
+    if($errors.Count-and$lastTime-and([datetime]$lastTime -gt (Get-Date).AddHours(-$ErrorWindowHours))){return 'ОШИБКА'}
+    if(-not $HasDbRow){return 'БЕЗ ЗАПИСИ БД'}
+    if(-not $CacheExists){return 'НЕТ КЭША'}
+    'OK'
+}
+
 function Get-AcceleratorInventory {
     param([Parameter(Mandatory)]$Instance,[ValidateRange(100,200000)][int]$LogTail=30000)
     $events=@(Get-AutoSyncLogAnalysis -Paths @($Instance.LogPaths) -Tail $LogTail);$byGuid=@{};$locations=Get-SynxModelLocationMap -Paths @($Instance.LocationDatabases)
@@ -330,14 +392,14 @@ function Get-AcceleratorInventory {
     $known=@{};$items=New-Object Collections.ArrayList
     foreach($row in $rows){
         $guid=[string]$row.Guid;$known[$guid]=$true;$me=if($byGuid.ContainsKey($guid)){@($byGuid[$guid])}else{@()};$repairTime=Get-SynxLatestRepairTime -History $history -Guid $guid;$eventState=Get-SynxModelEventState $me -After $repairTime;$hangs=@($eventState.Hangs);$errors=@($eventState.Errors);$last=@($eventState.Last);$first=@($eventState.FirstFailure);$lastTime=if($last.Count){$last[0].Time}else{$null};$firstTime=if($first.Count){$first[0].Time}else{$null};$lastMessage=if($last.Count){[string]$last[0].Raw}else{''};$folder=Join-Path $Instance.CachePath $guid;$location=if($locations.ContainsKey($guid)){$locations[$guid]}else{$null}
-        $status=if($hangs.Count-ge3){'ЗАВИСАНИЕ'}elseif($errors.Count){'ОШИБКА'}elseif(-not(Test-Path -LiteralPath $folder -PathType Container)){'НЕТ КЭША'}else{'OK'}
+        $status=Get-SynxModelStatus -EventState $eventState -CacheExists ([bool](Test-Path -LiteralPath $folder -PathType Container)) -HasDbRow $true
         [void]$items.Add([pscustomobject]@{Name=if($location){$location.Name}else{'—'};ModelPath=if($location){$location.ModelPath}else{''};Guid=$guid;HostNode=[string]$row.HostNode;Year=$Instance.Year;Status=$status;HangCount=$hangs.Count;ErrorCount=$errors.Count;LastEvent=$lastTime;EpisodeStart=$firstTime;LastMessage=$lastMessage;CacheExists=[bool](Test-Path -LiteralPath $folder -PathType Container);CachePath=$folder;InstanceRoot=$Instance.Root;HostDatabase=$Instance.HostDatabase;StatusDatabase=$Instance.StatusDatabase})
     }
     if(Test-Path -LiteralPath $Instance.CachePath){
         foreach($dir in @(Get-ChildItem -LiteralPath $Instance.CachePath -Directory -ErrorAction SilentlyContinue|Where-Object Name -match '^[0-9a-fA-F-]{36}$')){
             $guid=$dir.Name.ToLowerInvariant();if($known.ContainsKey($guid)){continue}
             $me=if($byGuid.ContainsKey($guid)){@($byGuid[$guid])}else{@()};$repairTime=Get-SynxLatestRepairTime -History $history -Guid $guid;$eventState=Get-SynxModelEventState $me -After $repairTime;$hangs=@($eventState.Hangs);$errors=@($eventState.Errors);$last=@($eventState.Last);$first=@($eventState.FirstFailure)
-            $status=if($hangs.Count-ge3){'ЗАВИСАНИЕ'}elseif($errors.Count){'ОШИБКА'}else{'БЕЗ ЗАПИСИ БД'};$location=if($locations.ContainsKey($guid)){$locations[$guid]}else{$null}
+            $status=Get-SynxModelStatus -EventState $eventState -CacheExists $true -HasDbRow $false;$location=if($locations.ContainsKey($guid)){$locations[$guid]}else{$null}
             [void]$items.Add([pscustomobject]@{Name=if($location){$location.Name}else{'—'};ModelPath=if($location){$location.ModelPath}else{''};Guid=$guid;HostNode='';Year=$Instance.Year;Status=$status;HangCount=$hangs.Count;ErrorCount=$errors.Count;LastEvent=if($last.Count){$last[0].Time}else{$null};EpisodeStart=if($first.Count){$first[0].Time}else{$null};LastMessage=if($last.Count){[string]$last[0].Raw}else{''};CacheExists=$true;CachePath=$dir.FullName;InstanceRoot=$Instance.Root;HostDatabase=$Instance.HostDatabase;StatusDatabase=$Instance.StatusDatabase})
         }
     }
@@ -392,12 +454,58 @@ function Get-SynxWebAppPoolState {
     ConvertTo-SynxAppPoolState $state
 }
 
+function Get-SynxAppPoolInventory {
+    # Снимок одним проходом: провайдер IIS плохо переносит Get-WebAppPoolState
+    # внутри собственного конвейера Get-ChildItem IIS:\AppPools.
+    Import-Module WebAdministration -ErrorAction Stop
+    $names=@(@(Get-ChildItem IIS:\AppPools)|ForEach-Object{[string]$_.Name}|Where-Object{$_})
+    $pools=@()
+    foreach($name in $names){
+        $state='Unknown';try{$state=Get-SynxWebAppPoolState $name}catch{}
+        $paths=@()
+        $pools+=,([pscustomobject]@{Name=$name;State=$state;Paths=$paths})
+    }
+    foreach($source in @('application','site')){
+        try{
+            $entries=if($source-eq'application'){@(Get-WebApplication)}else{@(Get-Website)}
+            foreach($entry in $entries){
+                $poolName=[string]$entry.applicationPool;$physical=[string]$entry.physicalPath
+                if((-not$poolName)-or(-not$physical)){continue}
+                foreach($pool in $pools){if([string]::Equals($pool.Name,$poolName,[StringComparison]::OrdinalIgnoreCase)){$pool.Paths+=,$physical}}
+            }
+        }catch{}
+    }
+    @($pools)
+}
+
+function Select-SynxRepairPools {
+    # Пул отбирается по якорному имени и по пути установки. Если в имени
+    # отобранного пула стоит другой год — это ошибка сопоставления, и ремонт
+    # обязан остановиться до любых изменений на диске.
+    param([Parameter(Mandatory)][object[]]$Pools,[Parameter(Mandatory)][string]$Year)
+    if(-not $Year){throw 'Не определён год версии Revit Server — отбор IIS-пулов невозможен.'}
+    $escaped=[regex]::Escape($Year);$selected=@()
+    foreach($pool in @($Pools)){
+        $name=[string]$pool.Name
+        $byName=($name-match"(?i)^RevitServer.*$escaped$")-or($name-match"(?i)^ModelService.*$escaped$")
+        $byPath=$false
+        foreach($path in @($pool.Paths)){if([string]$path-match"(?i)Revit\s*Server[^\\/]*$escaped"){$byPath=$true}}
+        if($byName-or$byPath){$selected+=,$pool}
+    }
+    foreach($pool in @($selected)){
+        $found=[regex]::Match([string]$pool.Name,'20\d{2}')
+        if($found.Success-and($found.Value-ne$Year)){throw "Отбор IIS-пулов дал чужую версию: $($pool.Name) при ремонте $Year. Ремонт остановлен, файлы не изменены."}
+    }
+    @($selected)
+}
+
 function Get-AcceleratorRepairTargets {
     param([Parameter(Mandatory)]$Model)
     $year=[string]$Model.Year;$services=@()
     try{$all=@(Get-CimInstance Win32_Service|Where-Object{$_.Name-match'(?i)Auto.?Sync'-or$_.DisplayName-match'(?i)Revit.*Auto.?Sync'-or$_.PathName-match'(?i)Auto.?Sync'});$services=@($all|Where-Object{([string]$_.PathName-match[regex]::Escape([string]$Model.InstanceRoot))-or([string]$_.Name-match$year)-or([string]$_.DisplayName-match$year)})}catch{}
-    $pools=@();try{Import-Module WebAdministration -ErrorAction Stop;$pools=@(Get-ChildItem IIS:\AppPools|Where-Object{$_.Name-match"(?i)RevitServerAppPool.*$year|ModelService.*$year"}|ForEach-Object{[pscustomobject]@{Name=$_.Name;State=Get-SynxWebAppPoolState $_.Name}})}catch{}
-    [pscustomobject]@{Services=@($services);Pools=@($pools)}
+    $pools=@();$poolError=''
+    try{$pools=@(Select-SynxRepairPools -Pools (Get-SynxAppPoolInventory) -Year $year)}catch{$poolError=$_.Exception.Message;$pools=@()}
+    [pscustomobject]@{Services=@($services);Pools=@($pools);PoolError=$poolError}
 }
 
 function New-AcceleratorRepairPreview {
@@ -406,15 +514,47 @@ function New-AcceleratorRepairPreview {
     [pscustomobject]@{Name=$Model.Name;ModelPath=$Model.ModelPath;Guid=$Model.Guid;HostNode=$Model.HostNode;Services=@($targets.Services|ForEach-Object{"$($_.DisplayName) [$($_.State)]"});Pools=@($targets.Pools|ForEach-Object{"$($_.Name) [$($_.State)]"})}
 }
 
+function Get-SynxPoolNameFromCommandLine {
+    param([AllowEmptyString()][string]$CommandLine)
+    $m=[regex]::Match([string]$CommandLine,'(?i)(^|\s)-ap\s+"(?<n>[^"]+)"');if($m.Success){return $m.Groups['n'].Value}
+    $m=[regex]::Match([string]$CommandLine,"(?i)(^|\s)-ap\s+'(?<n>[^']+)'");if($m.Success){return $m.Groups['n'].Value}
+    ''
+}
+
 function Stop-SynxLingeringPoolWorkers {
-    param([Parameter(Mandatory)]$Targets)
+    # Имя пула берётся из аргумента -ap точным сравнением: подстрочный матч
+    # цеплял RevitServerAppPool2022_Old при ремонте 2022. Завершение рвёт
+    # активные запросы пула, поэтому только когда пул уже Stopped.
+    param([Parameter(Mandatory)]$Targets,[int]$GraceSeconds=20)
     $poolNames=@($Targets.Pools|ForEach-Object{[string]$_.Name}|Where-Object{$_})
-    if($poolNames.Count-eq0){return}
-    foreach($process in @(Get-CimInstance Win32_Process -Filter "Name='w3wp.exe'" -ErrorAction SilentlyContinue)){
-        $commandLine=[string]$process.CommandLine;$belongs=$false
-        foreach($poolName in $poolNames){if($commandLine-match[regex]::Escape($poolName)){$belongs=$true;break}}
-        if($belongs){Stop-Process -Id ([int]$process.ProcessId) -Force -ErrorAction SilentlyContinue}
+    if($poolNames.Count-eq0){return @()}
+    foreach($poolName in $poolNames){
+        $state='';try{$state=Get-SynxWebAppPoolState $poolName}catch{$state=''}
+        if($state-ne'Stopped'){throw "IIS-пул $poolName не в состоянии Stopped; принудительное завершение отменено."}
     }
+    $deadline=(Get-Date).AddSeconds($GraceSeconds)
+    while((Get-Date)-lt$deadline){
+        if(@(Get-SynxPoolWorkerProcesses -PoolNames $poolNames).Count-eq0){return @()}
+        Start-Sleep -Seconds 2
+    }
+    $killed=@()
+    foreach($process in @(Get-SynxPoolWorkerProcesses -PoolNames $poolNames)){
+        Stop-Process -Id ([int]$process.ProcessId) -Force -ErrorAction SilentlyContinue
+        $killed+=,([int]$process.ProcessId)
+    }
+    @($killed)
+}
+
+function Get-SynxPoolWorkerProcesses {
+    param([string[]]$PoolNames)
+    $names=@(@($PoolNames)|Where-Object{$_});if($names.Count-eq0){return @()}
+    $result=@()
+    foreach($process in @(Get-CimInstance Win32_Process -Filter "Name='w3wp.exe'" -ErrorAction SilentlyContinue)){
+        $poolName=Get-SynxPoolNameFromCommandLine ([string]$process.CommandLine)
+        if(-not$poolName){continue}
+        foreach($name in $names){if([string]::Equals($poolName,$name,[StringComparison]::OrdinalIgnoreCase)){$result+=,$process;break}}
+    }
+    @($result)
 }
 
 function Wait-SynxServiceState([string]$Name,[string]$Status){for($i=0;$i-lt45;$i++){if([string](Get-Service $Name).Status-eq$Status){return};Start-Sleep 1};throw "Служба $Name не перешла в состояние $Status."}
@@ -426,8 +566,25 @@ function Set-SynxRuntimeState {
         foreach($p in @($Targets.Pools)){$current=Get-SynxWebAppPoolState $p.Name;if($current-ne'Stopped'){Stop-WebAppPool $p.Name;for($i=0;$i-lt45;$i++){if((Get-SynxWebAppPoolState $p.Name)-eq'Stopped'){break};Start-Sleep 1};if((Get-SynxWebAppPoolState $p.Name)-ne'Stopped'){throw "IIS-пул $($p.Name) не остановился."}}}
         Stop-SynxLingeringPoolWorkers $Targets
     }else{
-        foreach($p in @($Targets.Pools)){if((Get-SynxWebAppPoolState $p.Name)-ne'Started'){Start-WebAppPool $p.Name;for($i=0;$i-lt45;$i++){if((Get-SynxWebAppPoolState $p.Name)-eq'Started'){break};Start-Sleep 1};if((Get-SynxWebAppPoolState $p.Name)-ne'Started'){throw "IIS-пул $($p.Name) не запустился."}}}
-        foreach($s in @($Targets.Services)){if((Get-Service $s.Name).Status-ne'Running'){Start-Service $s.Name;Wait-SynxServiceState $s.Name 'Running'}}
+        # Поднимаем ВСЁ и лишь потом сообщаем об ошибках: прежняя версия падала
+        # на первом неподнявшемся пуле и оставляла остальные остановленными.
+        $problems=@()
+        foreach($p in @($Targets.Pools)){
+            try{
+                if((Get-SynxWebAppPoolState $p.Name)-ne'Started'){
+                    Start-WebAppPool $p.Name
+                    for($i=0;$i-lt45;$i++){if((Get-SynxWebAppPoolState $p.Name)-eq'Started'){break};Start-Sleep 1}
+                    if((Get-SynxWebAppPoolState $p.Name)-ne'Started'){throw 'не перешёл в Started'}
+                }
+            }catch{$problems+=,"IIS-пул $($p.Name): $($_.Exception.Message)"}
+        }
+        foreach($s in @($Targets.Services)){
+            try{
+                if([string]$s.StartMode-eq'Disabled'){throw 'служба отключена (StartMode=Disabled)'}
+                if((Get-Service $s.Name).Status-ne'Running'){Start-Service $s.Name;Wait-SynxServiceState $s.Name 'Running'}
+            }catch{$problems+=,"Служба $($s.Name): $($_.Exception.Message)"}
+        }
+        if($problems.Count){throw ("Не удалось вернуть компоненты в рабочее состояние: "+($problems-join'; '))}
     }
 }
 
@@ -500,6 +657,8 @@ function Invoke-AcceleratorModelRepair {
         foreach($db in @($Model.HostDatabase,$Model.StatusDatabase)){
             if($db-and(Test-Path -LiteralPath $db)){
                 $destination=Join-Path $backup ([IO.Path]::GetFileName($db))
+                # WAL сводится в основной файл, чтобы копия была самодостаточной
+                try{Invoke-SynxSqliteExecute -Path $db -Sql 'PRAGMA wal_checkpoint(TRUNCATE);'}catch{}
                 Copy-Item -LiteralPath $db -Destination $destination -Force
                 if((Get-Item -LiteralPath $db).Length-ne(Get-Item -LiteralPath $destination).Length){throw "Размер резервной копии не совпадает: $db"}
                 if((Get-FileHash -LiteralPath $db -Algorithm SHA256).Hash-ne(Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash){throw "SHA-256 резервной копии не совпадает: $db"}
@@ -526,12 +685,34 @@ function Invoke-AcceleratorModelRepair {
         Set-SynxRuntimeState $targets Start
         $manifest.Result='Changed';$manifest.Completed=Get-Date;$manifest|ConvertTo-Json -Depth 6|Set-Content (Join-Path $root manifest-after.json) -Encoding UTF8
 
-        $dbBackupPath=Join-Path $backup ([IO.Path]::GetFileName([string]$Model.HostDatabase))
+        $q={param($v) "'"+([string]$v).Replace("'","''")+"'"}
+        $serviceList=(@(@($targets.Services)|ForEach-Object{& $q $_.Name})-join',')
+        $poolList=(@(@($targets.Pools)|ForEach-Object{& $q $_.Name})-join',')
         @(
+            "# RevitServer Synx — откат ремонта. Запускать от имени администратора.",
             "`$ErrorActionPreference='Stop'",
-            "# Перед откатом остановите AutoSync и IIS-пул Revit Server $($Model.Year).",
-            "Copy-Item -LiteralPath '$($dbBackupPath.Replace("'","''"))' -Destination '$(([string]$Model.HostDatabase).Replace("'","''"))' -Force",
-            "if(Test-Path -LiteralPath '$($quarantine.Replace("'","''"))'){[IO.Directory]::Move('$($quarantine.Replace("'","''"))','$(([string]$Model.CachePath).Replace("'","''"))')}"
+            "`$services=@($serviceList)",
+            "`$pools=@($poolList)",
+            "`$backupDir=$(& $q $backup)",
+            "`$database=$(& $q ([string]$Model.HostDatabase))",
+            "`$quarantine=$(& $q $quarantine)",
+            "`$cachePath=$(& $q ([string]$Model.CachePath))",
+            "Import-Module WebAdministration -ErrorAction SilentlyContinue",
+            "foreach(`$s in `$services){ if(Get-Service -Name `$s -ErrorAction SilentlyContinue){ Stop-Service -Name `$s -Force -ErrorAction SilentlyContinue } }",
+            "foreach(`$p in `$pools){ try{ Stop-WebAppPool -Name `$p -ErrorAction SilentlyContinue }catch{} }",
+            "Start-Sleep -Seconds 5",
+            "`$name=[IO.Path]::GetFileName(`$database); `$src=Join-Path `$backupDir `$name",
+            "if(Test-Path -LiteralPath `$src){",
+            "  foreach(`$sfx in @('-wal','-shm','-journal')){",
+            "    `$t=`$database+`$sfx; if(Test-Path -LiteralPath `$t){ Remove-Item -LiteralPath `$t -Force }",
+            "    `$b=Join-Path `$backupDir (`$name+`$sfx); if(Test-Path -LiteralPath `$b){ Copy-Item -LiteralPath `$b -Destination `$t -Force }",
+            "  }",
+            "  Copy-Item -LiteralPath `$src -Destination `$database -Force",
+            "}",
+            "if(`$quarantine -and (Test-Path -LiteralPath `$quarantine) -and -not (Test-Path -LiteralPath `$cachePath)){ [IO.Directory]::Move(`$quarantine,`$cachePath) }",
+            "foreach(`$p in `$pools){ try{ Start-WebAppPool -Name `$p }catch{} }",
+            "foreach(`$s in `$services){ try{ Start-Service -Name `$s }catch{} }",
+            "Write-Host 'Откат завершён. Проверьте открытие и синхронизацию модели.' -ForegroundColor Green"
         )|Set-Content (Join-Path $root Rollback.ps1) -Encoding UTF8
 
         $historySaved=$true
@@ -543,7 +724,7 @@ function Invoke-AcceleratorModelRepair {
         try{
             Publish-RepairProgress 80 'Ошибка: выполняется безопасный откат'
             Set-SynxRuntimeState $targets Stop
-            if($changed){$copy=Join-Path $backup ([IO.Path]::GetFileName([string]$Model.HostDatabase));if(Test-Path $copy){Copy-Item -LiteralPath $copy -Destination $Model.HostDatabase -Force}}
+            if($changed){[void](Restore-SynxDatabaseSet -BackupDir $backup -Databases @($Model.HostDatabase))}
             if($moved-and(Test-Path $quarantine)-and-not(Test-Path $Model.CachePath)){[IO.Directory]::Move([string]$quarantine,[string]$Model.CachePath)}
             Set-SynxRuntimeState $targets Start
             Publish-RepairProgress 100 'Откат завершён'
@@ -653,4 +834,4 @@ function Invoke-SynxHostAddressMigration {
     }
 }
 
-Export-ModuleMember -Function Initialize-SynxSqlite,Invoke-SynxSqliteQuery,Invoke-SynxSqliteExecute,Get-SynxSqliteIntegrity,ConvertFrom-AutoSyncLogLine,Get-AutoSyncLogAnalysis,Find-AutoSyncLogs,Get-RevitAcceleratorInstances,ConvertFrom-SynxGuidHex,Get-SynxModelLocationMap,Split-SynxHostNode,Get-SynxHostAddressSummary,Test-SynxHostEndpoint,Import-SynxHostModelNames,Test-SynxCacheFiles,Get-SynxGuidLogContext,Test-SynxModelDiagnostics,Get-SynxHistoryPath,Read-SynxIncidentHistory,Write-SynxIncidentHistory,Get-SynxLatestRepairTime,Get-SynxModelEventState,Get-AcceleratorInventory,Test-SynxAdministrator,ConvertTo-SynxAppPoolState,Get-SynxWebAppPoolState,Get-AcceleratorRepairTargets,New-AcceleratorRepairPreview,Stop-SynxLingeringPoolWorkers,Set-SynxCacheRepairAccess,Move-SynxCacheDirectory,Invoke-AcceleratorModelRepair,Invoke-SynxHostAddressMigration
+Export-ModuleMember -Function Get-SynxModelStatus,Restore-SynxDatabaseSet,Get-SynxAppPoolInventory,Select-SynxRepairPools,Get-SynxPoolNameFromCommandLine,Get-SynxPoolWorkerProcesses,Initialize-SynxSqlite,Invoke-SynxSqliteQuery,Invoke-SynxSqliteExecute,Get-SynxSqliteIntegrity,ConvertFrom-AutoSyncLogLine,Get-AutoSyncLogAnalysis,Find-AutoSyncLogs,Get-RevitAcceleratorInstances,ConvertFrom-SynxGuidHex,Get-SynxModelLocationMap,Split-SynxHostNode,Get-SynxHostAddressSummary,Test-SynxHostEndpoint,Import-SynxHostModelNames,Test-SynxCacheFiles,Get-SynxGuidLogContext,Test-SynxModelDiagnostics,Get-SynxHistoryPath,Read-SynxIncidentHistory,Write-SynxIncidentHistory,Get-SynxLatestRepairTime,Get-SynxModelEventState,Get-AcceleratorInventory,Test-SynxAdministrator,ConvertTo-SynxAppPoolState,Get-SynxWebAppPoolState,Get-AcceleratorRepairTargets,New-AcceleratorRepairPreview,Stop-SynxLingeringPoolWorkers,Set-SynxCacheRepairAccess,Move-SynxCacheDirectory,Invoke-AcceleratorModelRepair,Invoke-SynxHostAddressMigration
