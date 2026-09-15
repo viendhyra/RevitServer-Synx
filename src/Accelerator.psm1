@@ -22,7 +22,7 @@ namespace RevitServerSynx {
     [DllImport("winsqlite3.dll",CallingConvention=CallingConvention.Cdecl)] static extern int sqlite3_exec(IntPtr db,IntPtr sql,IntPtr cb,IntPtr arg,out IntPtr error);
     [DllImport("winsqlite3.dll",CallingConvention=CallingConvention.Cdecl)] static extern void sqlite3_free(IntPtr p);
     static IntPtr Utf8(string s){byte[] b=Encoding.UTF8.GetBytes(s+"\0");IntPtr p=Marshal.AllocHGlobal(b.Length);Marshal.Copy(b,0,p,b.Length);return p;}
-    static string Text(IntPtr p){return p==IntPtr.Zero?null:Marshal.PtrToStringAnsi(p);}
+    static string Text(IntPtr p){if(p==IntPtr.Zero)return null;int n=0;while(Marshal.ReadByte(p,n)!=0)n++;byte[] b=new byte[n];Marshal.Copy(p,b,0,n);return Encoding.UTF8.GetString(b);}
     static IntPtr Open(string path,int flags){IntPtr db,p=Utf8(path);try{int c=sqlite3_open_v2(p,out db,flags,IntPtr.Zero);if(c!=OK){string m=db==IntPtr.Zero?"open failed":Text(sqlite3_errmsg(db));if(db!=IntPtr.Zero)sqlite3_close(db);throw new InvalidOperationException("SQLite open ("+c+"): "+m);}return db;}finally{Marshal.FreeHGlobal(p);}}
     public static List<Dictionary<string,string>> Query(string path,string sql){IntPtr db=Open(path,READONLY),stmt=IntPtr.Zero,p=Utf8(sql);try{int c=sqlite3_prepare_v2(db,p,-1,out stmt,IntPtr.Zero);if(c!=OK)throw new InvalidOperationException("SQLite prepare ("+c+"): "+Text(sqlite3_errmsg(db)));var rows=new List<Dictionary<string,string>>();int n=sqlite3_column_count(stmt);while((c=sqlite3_step(stmt))==ROW){var row=new Dictionary<string,string>(StringComparer.OrdinalIgnoreCase);for(int i=0;i<n;i++)row[Text(sqlite3_column_name(stmt,i))]=Text(sqlite3_column_text(stmt,i));rows.Add(row);}if(c!=DONE)throw new InvalidOperationException("SQLite query ("+c+"): "+Text(sqlite3_errmsg(db)));return rows;}finally{if(stmt!=IntPtr.Zero)sqlite3_finalize(stmt);Marshal.FreeHGlobal(p);sqlite3_close(db);}}
     public static void Execute(string path,string sql){IntPtr db=Open(path,READWRITE),error=IntPtr.Zero,p=Utf8(sql);try{int c=sqlite3_exec(db,p,IntPtr.Zero,IntPtr.Zero,out error);if(c!=OK)throw new InvalidOperationException("SQLite write ("+c+"): "+(error==IntPtr.Zero?Text(sqlite3_errmsg(db)):Text(error)));}finally{if(error!=IntPtr.Zero)sqlite3_free(error);Marshal.FreeHGlobal(p);sqlite3_close(db);}}
@@ -84,8 +84,33 @@ function Get-RevitAcceleratorInstances {
     if(-not$ProgramDataPath){return @()};$autodesk=Join-Path $ProgramDataPath 'Autodesk';if(-not(Test-Path -LiteralPath $autodesk)){return @()}
     foreach($dir in @(Get-ChildItem -LiteralPath $autodesk -Directory -Filter 'Revit Server 20??' -ErrorAction SilentlyContinue|Sort-Object Name)){
         $year=([regex]::Match($dir.Name,'20\d{2}')).Value;$cache=Join-Path $dir.FullName 'Cache';$hostDb=Join-Path $cache 'HostNodeForCachedModels.db3';$statusDb=Join-Path $cache 'LocalServer_Cache.db3';$logs=@(Find-AutoSyncLogs $dir.FullName)
-        if((Test-Path -LiteralPath $cache)-or(Test-Path -LiteralPath $hostDb)-or$logs.Count-gt 0){[pscustomobject]@{Name=$dir.Name;Year=$year;Root=$dir.FullName;CachePath=$cache;HostDatabase=$hostDb;StatusDatabase=$statusDb;LogPaths=$logs}}
+        $locationDatabases=@((Join-Path $dir.FullName 'Projects\ModelLocationTable.db3'),(Join-Path $dir.FullName 'ModelLocationTable.db3'))|Where-Object{Test-Path -LiteralPath $_ -PathType Leaf}|Sort-Object -Unique
+        if((Test-Path -LiteralPath $cache)-or(Test-Path -LiteralPath $hostDb)-or$logs.Count-gt 0){[pscustomobject]@{Name=$dir.Name;Year=$year;Root=$dir.FullName;CachePath=$cache;HostDatabase=$hostDb;StatusDatabase=$statusDb;LocationDatabases=@($locationDatabases);LogPaths=$logs}}
     }
+}
+
+function ConvertFrom-SynxGuidHex {
+    param([Parameter(Mandatory)][string]$Hex)
+    if($Hex-notmatch'^[0-9a-fA-F]{32}$'){return ''}
+    $bytes=New-Object byte[] 16
+    for($i=0;$i-lt16;$i++){$bytes[$i]=[Convert]::ToByte($Hex.Substring($i*2,2),16)}
+    ([Guid]::new($bytes)).ToString().ToLowerInvariant()
+}
+
+function Get-SynxModelLocationMap {
+    param([string[]]$Paths)
+    $result=@{}
+    foreach($path in @($Paths|Where-Object{$_-and(Test-Path -LiteralPath $_ -PathType Leaf)}|Sort-Object -Unique)){
+        try{
+            $sql='SELECT typeof(ModelIdentityGUID) AS GuidType, hex(ModelIdentityGUID) AS GuidHex, CAST(ModelIdentityGUID AS TEXT) AS GuidText, ModelPath, ModelNormalizedPath FROM ModelStorageTable;'
+            foreach($row in @(Invoke-SynxSqliteQuery $path $sql)){
+                $guid=if($row.GuidType-eq'blob'){ConvertFrom-SynxGuidHex ([string]$row.GuidHex)}elseif(([string]$row.GuidText)-match'^[0-9a-fA-F-]{36}$'){([string]$row.GuidText).ToLowerInvariant()}else{''}
+                if(-not$guid){continue};$modelPath=if($row.ModelPath){[string]$row.ModelPath}else{[string]$row.ModelNormalizedPath}
+                $result[$guid]=[pscustomobject]@{Name=[IO.Path]::GetFileName($modelPath);ModelPath=$modelPath;Source=$path}
+            }
+        }catch{}
+    }
+    $result
 }
 
 function Get-SynxModelEventState {
@@ -104,7 +129,7 @@ function Get-SynxModelEventState {
 
 function Get-AcceleratorInventory {
     param([Parameter(Mandatory)]$Instance,[ValidateRange(100,200000)][int]$LogTail=30000)
-    $events=@(Get-AutoSyncLogAnalysis @($Instance.LogPaths) $LogTail);$byGuid=@{}
+    $events=@(Get-AutoSyncLogAnalysis @($Instance.LogPaths) $LogTail);$byGuid=@{};$locations=Get-SynxModelLocationMap @($Instance.LocationDatabases)
     foreach($event in @($events|Where-Object Guid)){if(-not$byGuid.ContainsKey($event.Guid)){$byGuid[$event.Guid]=New-Object Collections.ArrayList};[void]$byGuid[$event.Guid].Add($event)}
     $rows=@();$dbIntegrity='missing'
     if(Test-Path -LiteralPath $Instance.HostDatabase -PathType Leaf){$dbIntegrity=Get-SynxSqliteIntegrity $Instance.HostDatabase;if($dbIntegrity-eq'ok'){$rows=@(Invoke-SynxSqliteQuery $Instance.HostDatabase 'SELECT lower(ModelIdentityGUID) AS Guid, HostNode FROM HostNodeForCachedModels ORDER BY ModelIdentityGUID;')}}
@@ -112,12 +137,12 @@ function Get-AcceleratorInventory {
     if(Test-Path -LiteralPath $Instance.StatusDatabase -PathType Leaf){$statusIntegrity=Get-SynxSqliteIntegrity $Instance.StatusDatabase;if($statusIntegrity-eq'ok'){$s=@(Invoke-SynxSqliteQuery $Instance.StatusDatabase 'SELECT CacheStatus FROM CacheStatus LIMIT 1;')|Select-Object -First 1;if($null-ne$s){$cacheStatus=[string]$s.CacheStatus}}}
     $known=@{};$items=New-Object Collections.ArrayList
     foreach($row in $rows){
-        $guid=[string]$row.Guid;$known[$guid]=$true;$me=if($byGuid.ContainsKey($guid)){@($byGuid[$guid])}else{@()};$eventState=Get-SynxModelEventState $me;$hangs=@($eventState.Hangs);$errors=@($eventState.Errors);$last=@($eventState.Last);$lastTime=if($last.Count){$last[0].Time}else{$null};$folder=Join-Path $Instance.CachePath $guid
+        $guid=[string]$row.Guid;$known[$guid]=$true;$me=if($byGuid.ContainsKey($guid)){@($byGuid[$guid])}else{@()};$eventState=Get-SynxModelEventState $me;$hangs=@($eventState.Hangs);$errors=@($eventState.Errors);$last=@($eventState.Last);$lastTime=if($last.Count){$last[0].Time}else{$null};$folder=Join-Path $Instance.CachePath $guid;$location=if($locations.ContainsKey($guid)){$locations[$guid]}else{$null}
         $status=if($hangs.Count-ge3){'ЗАВИСАНИЕ'}elseif($errors.Count){'ОШИБКА'}elseif(-not(Test-Path -LiteralPath $folder -PathType Container)){'НЕТ КЭША'}else{'OK'}
-        [void]$items.Add([pscustomobject]@{Guid=$guid;HostNode=[string]$row.HostNode;Year=$Instance.Year;Status=$status;HangCount=$hangs.Count;ErrorCount=$errors.Count;LastEvent=$lastTime;CacheExists=[bool](Test-Path -LiteralPath $folder -PathType Container);CachePath=$folder;InstanceRoot=$Instance.Root;HostDatabase=$Instance.HostDatabase;StatusDatabase=$Instance.StatusDatabase})
+        [void]$items.Add([pscustomobject]@{Name=if($location){$location.Name}else{'—'};ModelPath=if($location){$location.ModelPath}else{''};Guid=$guid;HostNode=[string]$row.HostNode;Year=$Instance.Year;Status=$status;HangCount=$hangs.Count;ErrorCount=$errors.Count;LastEvent=$lastTime;CacheExists=[bool](Test-Path -LiteralPath $folder -PathType Container);CachePath=$folder;InstanceRoot=$Instance.Root;HostDatabase=$Instance.HostDatabase;StatusDatabase=$Instance.StatusDatabase})
     }
-    if(Test-Path -LiteralPath $Instance.CachePath){foreach($dir in @(Get-ChildItem -LiteralPath $Instance.CachePath -Directory -ErrorAction SilentlyContinue|Where-Object Name -match '^[0-9a-fA-F-]{36}$')){$guid=$dir.Name.ToLowerInvariant();if($known.ContainsKey($guid)){continue};$me=if($byGuid.ContainsKey($guid)){@($byGuid[$guid])}else{@()};$eventState=Get-SynxModelEventState $me;$hangs=@($eventState.Hangs);$errors=@($eventState.Errors);$last=@($eventState.Last);$status=if($hangs.Count-ge3){'ЗАВИСАНИЕ'}elseif($errors.Count){'ОШИБКА'}else{'БЕЗ ЗАПИСИ БД'};[void]$items.Add([pscustomobject]@{Guid=$guid;HostNode='';Year=$Instance.Year;Status=$status;HangCount=$hangs.Count;ErrorCount=$errors.Count;LastEvent=if($last.Count){$last[0].Time}else{$null};CacheExists=$true;CachePath=$dir.FullName;InstanceRoot=$Instance.Root;HostDatabase=$Instance.HostDatabase;StatusDatabase=$Instance.StatusDatabase})}}
-    [pscustomobject]@{Instance=$Instance;Models=@($items|Sort-Object @{Expression={if($_.Status-eq'ЗАВИСАНИЕ'){0}elseif($_.Status-eq'ОШИБКА'){1}else{2}}},Guid);Events=$events;DatabaseIntegrity=$dbIntegrity;StatusDatabaseIntegrity=$statusIntegrity;CacheStatus=$cacheStatus}
+    if(Test-Path -LiteralPath $Instance.CachePath){foreach($dir in @(Get-ChildItem -LiteralPath $Instance.CachePath -Directory -ErrorAction SilentlyContinue|Where-Object Name -match '^[0-9a-fA-F-]{36}$')){$guid=$dir.Name.ToLowerInvariant();if($known.ContainsKey($guid)){continue};$me=if($byGuid.ContainsKey($guid)){@($byGuid[$guid])}else{@()};$eventState=Get-SynxModelEventState $me;$hangs=@($eventState.Hangs);$errors=@($eventState.Errors);$last=@($eventState.Last);$status=if($hangs.Count-ge3){'ЗАВИСАНИЕ'}elseif($errors.Count){'ОШИБКА'}else{'БЕЗ ЗАПИСИ БД'};$location=if($locations.ContainsKey($guid)){$locations[$guid]}else{$null};[void]$items.Add([pscustomobject]@{Name=if($location){$location.Name}else{'—'};ModelPath=if($location){$location.ModelPath}else{''};Guid=$guid;HostNode='';Year=$Instance.Year;Status=$status;HangCount=$hangs.Count;ErrorCount=$errors.Count;LastEvent=if($last.Count){$last[0].Time}else{$null};CacheExists=$true;CachePath=$dir.FullName;InstanceRoot=$Instance.Root;HostDatabase=$Instance.HostDatabase;StatusDatabase=$Instance.StatusDatabase})}}
+    [pscustomobject]@{Instance=$Instance;Models=@($items|Sort-Object @{Expression={if($_.Status-eq'ЗАВИСАНИЕ'){0}elseif($_.Status-eq'ОШИБКА'){1}else{2}}},Name,Guid);Events=$events;DatabaseIntegrity=$dbIntegrity;StatusDatabaseIntegrity=$statusIntegrity;CacheStatus=$cacheStatus;ResolvedNames=$locations.Count}
 }
 
 function Test-SynxAdministrator {
@@ -135,7 +160,7 @@ function Get-AcceleratorRepairTargets {
 function New-AcceleratorRepairPreview {
     param([Parameter(Mandatory)]$Model)
     $targets=Get-AcceleratorRepairTargets $Model
-    [pscustomobject]@{Guid=$Model.Guid;HostNode=$Model.HostNode;Services=@($targets.Services|ForEach-Object{"$($_.DisplayName) [$($_.State)]"});Pools=@($targets.Pools|ForEach-Object{"$($_.Name) [$($_.State)]"})}
+    [pscustomobject]@{Name=$Model.Name;ModelPath=$Model.ModelPath;Guid=$Model.Guid;HostNode=$Model.HostNode;Services=@($targets.Services|ForEach-Object{"$($_.DisplayName) [$($_.State)]"});Pools=@($targets.Pools|ForEach-Object{"$($_.Name) [$($_.State)]"})}
 }
 
 function Wait-SynxServiceState([string]$Name,[string]$Status){for($i=0;$i-lt45;$i++){if([string](Get-Service $Name).Status-eq$Status){return};Start-Sleep 1};throw "Служба $Name не перешла в состояние $Status."}
@@ -153,34 +178,68 @@ function Set-SynxRuntimeState {
 
 function Invoke-AcceleratorModelRepair {
     [CmdletBinding(SupportsShouldProcess=$true,ConfirmImpact='High')]
-    param([Parameter(Mandatory)]$Model,[Parameter(Mandatory)][string]$OutputRoot)
-    if(-not(Test-SynxAdministrator)){throw 'Запустите Windows PowerShell от имени администратора.'};$guid=[string]$Model.Guid
+    param([Parameter(Mandatory)]$Model,[Parameter(Mandatory)][string]$OutputRoot,[scriptblock]$ProgressCallback)
+    function Publish-RepairProgress([int]$Percent,[string]$Message){if($ProgressCallback){&$ProgressCallback $Percent $Message}}
+
+    Publish-RepairProgress 2 'Проверка выбранной модели'
+    if(-not(Test-SynxAdministrator)){throw 'Запустите Windows PowerShell от имени администратора.'}
+    $guid=[string]$Model.Guid
     if($guid-notmatch'^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$'){throw 'Недопустимый GUID.'}
-    $expected=Join-Path ([string]$Model.InstanceRoot) ('Cache\'+$guid);if([IO.Path]::GetFullPath([string]$Model.CachePath).TrimEnd('\')-ne[IO.Path]::GetFullPath($expected).TrimEnd('\')){throw 'Путь кэша не соответствует экземпляру Revit Server.'}
+    $expected=Join-Path ([string]$Model.InstanceRoot) ('Cache\'+$guid)
+    if([IO.Path]::GetFullPath([string]$Model.CachePath).TrimEnd('\')-ne[IO.Path]::GetFullPath($expected).TrimEnd('\')){throw 'Путь кэша не соответствует экземпляру Revit Server.'}
     if(-not$PSCmdlet.ShouldProcess($guid,'Точечный ремонт кэша Accelerator')){return [pscustomobject]@{Status='Skipped';Guid=$guid;Message='Отменено'}}
-    $stamp=Get-Date -Format yyyy-MM-dd_HHmmss;$root=Join-Path $OutputRoot "Repair_${guid}_$stamp";$backup=Join-Path $root DatabaseBackup;$qroot=Join-Path ([string]$Model.InstanceRoot) SynxQuarantine;$quarantine=Join-Path $qroot "${guid}_$stamp";New-Item -ItemType Directory -Path $backup,$qroot -Force|Out-Null
+
+    $stamp=Get-Date -Format yyyy-MM-dd_HHmmss
+    $root=Join-Path $OutputRoot "Repair_${guid}_$stamp"
+    $backup=Join-Path $root DatabaseBackup
+    $qroot=Join-Path ([string]$Model.InstanceRoot) SynxQuarantine
+    $quarantine=Join-Path $qroot "${guid}_$stamp"
+    New-Item -ItemType Directory -Path $backup,$qroot -Force|Out-Null
+
+    Publish-RepairProgress 8 'Поиск AutoSync и IIS-пула'
     $targets=Get-AcceleratorRepairTargets $Model
-    if($targets.Services.Count-eq0){throw "Служба Revit Server AutoSync $($Model.Year) не найдена. Ремонт остановлен до изменения файлов."}
-    if($targets.Pools.Count-eq0){throw "IIS-пул Revit Server $($Model.Year) не найден. Ремонт остановлен до изменения файлов."}
+    if($targets.Services.Count-eq0){throw "Служба Revit Server AutoSync $($Model.Year) не найдена. Файлы не изменены."}
+    if($targets.Pools.Count-eq0){throw "IIS-пул Revit Server $($Model.Year) не найден. Файлы не изменены."}
+
     $moved=$false;$changed=$false
-    $manifest=[ordered]@{Created=Get-Date;Guid=$guid;HostNode=$Model.HostNode;InstanceRoot=$Model.InstanceRoot;CachePath=$Model.CachePath;Quarantine=$quarantine;Services=@($targets.Services|Select-Object Name,DisplayName,State);Pools=@($targets.Pools);Result='Started'}
+    $manifest=[ordered]@{Created=Get-Date;Name=$Model.Name;ModelPath=$Model.ModelPath;Guid=$guid;HostNode=$Model.HostNode;InstanceRoot=$Model.InstanceRoot;CachePath=$Model.CachePath;Quarantine=$quarantine;Services=@($targets.Services|Select-Object Name,DisplayName,State);Pools=@($targets.Pools);Result='Started'}
     try{
+        Publish-RepairProgress 12 'Сохранение плана ремонта'
         $manifest|ConvertTo-Json -Depth 6|Set-Content (Join-Path $root manifest-before.json) -Encoding UTF8
+
+        Publish-RepairProgress 20 'Остановка AutoSync и IIS-пула'
         Set-SynxRuntimeState $targets Stop
+
+        Publish-RepairProgress 35 'Создание бэкапа SQLite-баз'
         foreach($db in @($Model.HostDatabase,$Model.StatusDatabase)){
             if($db-and(Test-Path -LiteralPath $db)){
                 $destination=Join-Path $backup ([IO.Path]::GetFileName($db))
                 Copy-Item -LiteralPath $db -Destination $destination -Force
                 if((Get-Item -LiteralPath $db).Length-ne(Get-Item -LiteralPath $destination).Length){throw "Размер резервной копии не совпадает: $db"}
-                if((Get-FileHash -LiteralPath $db -Algorithm SHA256).Hash-ne(Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash){throw "Контрольная сумма резервной копии не совпадает: $db"}
-                foreach($suffix in @('-journal','-wal','-shm')){
-                    if(Test-Path -LiteralPath ($db+$suffix)){Copy-Item -LiteralPath ($db+$suffix) -Destination (Join-Path $backup ([IO.Path]::GetFileName($db+$suffix))) -Force}
-                }
+                if((Get-FileHash -LiteralPath $db -Algorithm SHA256).Hash-ne(Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash){throw "SHA-256 резервной копии не совпадает: $db"}
+                foreach($suffix in @('-journal','-wal','-shm')){if(Test-Path -LiteralPath ($db+$suffix)){Copy-Item -LiteralPath ($db+$suffix) -Destination (Join-Path $backup ([IO.Path]::GetFileName($db+$suffix))) -Force}}
             }
         }
-        if(Test-Path -LiteralPath $Model.CachePath -PathType Container){Move-Item $Model.CachePath $quarantine -Force;$moved=$true}
-        if(Test-Path -LiteralPath $Model.HostDatabase){Invoke-SynxSqliteExecute $Model.HostDatabase "BEGIN IMMEDIATE; DELETE FROM HostNodeForCachedModels WHERE lower(ModelIdentityGUID)=lower('$guid'); COMMIT;";$changed=$true;$integrity=Get-SynxSqliteIntegrity $Model.HostDatabase;if($integrity-ne'ok'){throw "Проверка базы: $integrity"};if(@(Invoke-SynxSqliteQuery $Model.HostDatabase "SELECT ModelIdentityGUID FROM HostNodeForCachedModels WHERE lower(ModelIdentityGUID)=lower('$guid');").Count){throw 'GUID остался в базе.'}}
-        Set-SynxRuntimeState $targets Start;$manifest.Result='Changed';$manifest.Completed=Get-Date;$manifest|ConvertTo-Json -Depth 6|Set-Content (Join-Path $root manifest-after.json) -Encoding UTF8
+        Publish-RepairProgress 48 'Бэкап баз проверен по SHA-256'
+
+        Publish-RepairProgress 55 'Удаление кэша GUID из активной системы'
+        if(Test-Path -LiteralPath $Model.CachePath -PathType Container){Move-Item -LiteralPath $Model.CachePath -Destination $quarantine -Force;$moved=$true}
+
+        Publish-RepairProgress 65 'Удаление привязки GUID из локальной базы'
+        if(Test-Path -LiteralPath $Model.HostDatabase){Invoke-SynxSqliteExecute $Model.HostDatabase "BEGIN IMMEDIATE; DELETE FROM HostNodeForCachedModels WHERE lower(ModelIdentityGUID)=lower('$guid'); COMMIT;";$changed=$true}
+
+        Publish-RepairProgress 75 'Проверка удаления локальных данных GUID'
+        if(Test-Path -LiteralPath $Model.CachePath){throw 'Каталог GUID остался в активном кэше.'}
+        if(Test-Path -LiteralPath $Model.HostDatabase){
+            $integrity=Get-SynxSqliteIntegrity $Model.HostDatabase
+            if($integrity-ne'ok'){throw "Проверка базы: $integrity"}
+            if(@(Invoke-SynxSqliteQuery $Model.HostDatabase "SELECT ModelIdentityGUID FROM HostNodeForCachedModels WHERE lower(ModelIdentityGUID)=lower('$guid');").Count){throw 'GUID остался в базе.'}
+        }
+
+        Publish-RepairProgress 88 'Запуск IIS-пула и AutoSync'
+        Set-SynxRuntimeState $targets Start
+        $manifest.Result='Changed';$manifest.Completed=Get-Date;$manifest|ConvertTo-Json -Depth 6|Set-Content (Join-Path $root manifest-after.json) -Encoding UTF8
+
         $dbBackupPath=Join-Path $backup ([IO.Path]::GetFileName([string]$Model.HostDatabase))
         @(
             "`$ErrorActionPreference='Stop'",
@@ -188,17 +247,22 @@ function Invoke-AcceleratorModelRepair {
             "Copy-Item -LiteralPath '$($dbBackupPath.Replace("'","''"))' -Destination '$(([string]$Model.HostDatabase).Replace("'","''"))' -Force",
             "if(Test-Path -LiteralPath '$($quarantine.Replace("'","''"))'){Move-Item -LiteralPath '$($quarantine.Replace("'","''"))' -Destination '$(([string]$Model.CachePath).Replace("'","''"))' -Force}"
         )|Set-Content (Join-Path $root Rollback.ps1) -Encoding UTF8
-        [pscustomobject]@{Status='Changed';Guid=$guid;Message='Кэш перенесён в карантин, запись удалена, база проверена, компоненты запущены.';ActionRoot=$root;Quarantine=$quarantine}
+
+        Publish-RepairProgress 100 'Готово: локальные данные модели очищены'
+        [pscustomobject]@{Status='Changed';Name=$Model.Name;Guid=$guid;Message='Активный кэш GUID и локальная привязка удалены; база проверена; компоненты запущены.';ActionRoot=$root;Quarantine=$quarantine}
     }catch{
         $errorText=$_.Exception.Message
         try{
+            Publish-RepairProgress 80 'Ошибка: выполняется безопасный откат'
             Set-SynxRuntimeState $targets Stop
             if($changed){$copy=Join-Path $backup ([IO.Path]::GetFileName([string]$Model.HostDatabase));if(Test-Path $copy){Copy-Item -LiteralPath $copy -Destination $Model.HostDatabase -Force}}
             if($moved-and(Test-Path $quarantine)-and-not(Test-Path $Model.CachePath)){Move-Item -LiteralPath $quarantine -Destination $Model.CachePath -Force}
             Set-SynxRuntimeState $targets Start
+            Publish-RepairProgress 100 'Откат завершён'
         }catch{$errorText+="; откат: $($_.Exception.Message)"}
-        $manifest.Result='Failed';$manifest.Error=$errorText;$manifest|ConvertTo-Json -Depth 6|Set-Content (Join-Path $root manifest-error.json) -Encoding UTF8;throw $errorText
+        $manifest.Result='Failed';$manifest.Error=$errorText;$manifest|ConvertTo-Json -Depth 6|Set-Content (Join-Path $root manifest-error.json) -Encoding UTF8
+        throw $errorText
     }
 }
 
-Export-ModuleMember -Function Initialize-SynxSqlite,Invoke-SynxSqliteQuery,Invoke-SynxSqliteExecute,Get-SynxSqliteIntegrity,ConvertFrom-AutoSyncLogLine,Get-AutoSyncLogAnalysis,Find-AutoSyncLogs,Get-RevitAcceleratorInstances,Get-SynxModelEventState,Get-AcceleratorInventory,Test-SynxAdministrator,Get-AcceleratorRepairTargets,New-AcceleratorRepairPreview,Invoke-AcceleratorModelRepair
+Export-ModuleMember -Function Initialize-SynxSqlite,Invoke-SynxSqliteQuery,Invoke-SynxSqliteExecute,Get-SynxSqliteIntegrity,ConvertFrom-AutoSyncLogLine,Get-AutoSyncLogAnalysis,Find-AutoSyncLogs,Get-RevitAcceleratorInstances,ConvertFrom-SynxGuidHex,Get-SynxModelLocationMap,Get-SynxModelEventState,Get-AcceleratorInventory,Test-SynxAdministrator,Get-AcceleratorRepairTargets,New-AcceleratorRepairPreview,Invoke-AcceleratorModelRepair

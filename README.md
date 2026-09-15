@@ -30,6 +30,7 @@ notepad $file
 - установленные экземпляры `Revit Server 20xx` в `%ProgramData%\Autodesk`;
 - `AutoSyncLog.log` и повторения `threads are still not done for Model`;
 - GUID зависших моделей и номера циклов AutoSync;
+- имя и RSN-путь модели из `Projects\ModelLocationTable.db3`;
 - ошибки разрешения HostNode/IP;
 - `HostNodeForCachedModels.db3` и привязки GUID → Host;
 - `LocalServer_Cache.db3` и `CacheStatus`;
@@ -48,11 +49,13 @@ notepad $file
 3. останавливает соответствующий `RevitServerAppPool20xx`;
 4. создаёт резервную копию обеих `.db3` и служебных journal/WAL-файлов;
 5. проверяет размер и SHA-256 резервных копий баз;
-6. переносит только `Cache\<выбранный GUID>` в `SynxQuarantine` без копирования кэша;
+6. удаляет из активной системы весь каталог `Cache\<выбранный GUID>`, быстро перемещая его в `SynxQuarantine` без копирования;
 7. транзакционно удаляет только выбранный GUID из `HostNodeForCachedModels.db3`;
 8. выполняет `PRAGMA integrity_check`;
 9. запускает компоненты, которые работали до ремонта;
 10. создаёт отчёт и `Rollback.ps1`.
+
+Каждый шаг показывается в окне: процент, текущая операция и журнал уже выполненных действий.
 
 Если шаг завершается ошибкой, программа пытается автоматически восстановить базу, каталог кэша и состояние компонентов.
 
@@ -67,6 +70,8 @@ notepad $file
 - `БЕЗ ЗАПИСИ БД` — каталог GUID есть, привязки к HostNode нет.
 
 Revit Server хранит в локальной базе Accelerator GUID и HostNode, но не читаемое имя RVT. Поэтому основной идентификатор в первой версии — GUID из `AutoSyncLog` и каталога `Cache`.
+
+Для имени программа автоматически читает `%ProgramData%\Autodesk\Revit Server 20xx\Projects\ModelLocationTable.db3`. Если Accelerator и Host стоят на разных серверах, скопируйте `ModelLocationTable.db3` с Host и выберите её кнопкой **«База имён…»**. Эта база используется только для чтения и не изменяется при ремонте.
 
 ## Требования
 
