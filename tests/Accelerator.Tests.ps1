@@ -13,7 +13,7 @@ Describe 'Model name mapping' {
   }
   It 'reads the model name and path from ModelLocationTable' {
     $db=Join-Path $TestDrive 'ModelLocationTable.db3';[IO.File]::WriteAllBytes($db,[byte[]]@())
-    Invoke-SynxSqliteExecute $db "CREATE TABLE ModelStorageTable (ModelIdentityGUID GUID, ModelNormalizedPath STRING, ModelPath STRING); INSERT INTO ModelStorageTable VALUES (X'ad1a670f8aae2b458b8d467ebf402643','project\\model.rvt','Project\\Named_Model.rvt');"
+    Invoke-SynxSqliteExecute $db "CREATE TABLE ModelStorageTable (ModelIdentityGUID GUID, ModelNormalizedPath STRING, ModelPath STRING); INSERT INTO ModelStorageTable VALUES (X'ad1a670f8aae2b458b8d467ebf402643','project\model.rvt','Project\Named_Model.rvt');"
     $map=Get-SynxModelLocationMap @($db);$map['0f671aad-ae8a-452b-8b8d-467ebf402643'].Name|Should -Be 'Named_Model.rvt';$map['0f671aad-ae8a-452b-8b8d-467ebf402643'].ModelPath|Should -Be 'Project\Named_Model.rvt'
   }
 }
