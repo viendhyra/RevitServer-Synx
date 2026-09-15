@@ -194,7 +194,7 @@ function Test-SynxCacheFiles {
 }
 
 function Get-SynxGuidLogContext {
-    param([Parameter(Mandatory)][string]$Guid,[string[]]$Paths,[ValidateRange(100,200000)][int]$Tail=50000,[ValidateRange(0,20)][int]$Before=4,[ValidateRange(0,20)][int]$After=6)
+    param([Parameter(Mandatory)][string]$Guid,[string[]]$Paths,[ValidateRange(100,200000)][int]$Tail=50000,[ValidateRange(0,100)][int]$Before=12,[ValidateRange(0,100)][int]$After=40)
     $result=New-Object Collections.ArrayList;$needle=$Guid.ToLowerInvariant()
     foreach($path in @($Paths)){
         if((-not$path)-or(-not(Test-Path -LiteralPath $path -PathType Leaf))){continue}
@@ -211,13 +211,39 @@ function Test-SynxModelDiagnostics {
     $context=@(Get-SynxGuidLogContext -Guid ([string]$Model.Guid) -Paths $LogPaths)
     if(-not(Test-Path -LiteralPath $ReportDirectory)){New-Item -ItemType Directory -Path $ReportDirectory -Force|Out-Null}
     $report=Join-Path $ReportDirectory ("ModelDiagnostic_$($Model.Guid)_$(Get-Date -Format yyyy-MM-dd_HHmmss).json")
-    $recommendations=New-Object Collections.ArrayList
-    if(@($cache.DatabaseChecks|Where-Object{$_.Integrity-ne'ok'}).Count){[void]$recommendations.Add('Повреждена или заблокирована внутренняя SQLite-база кэша. Остановите AutoSync/IIS и повторите проверку; при сохранении ошибки выполните точечный ремонт.')}
-    if($cache.TransactionSidecars.Count){[void]$recommendations.Add('Найдены journal/WAL/SHM. При работающем AutoSync это может быть нормальной активной транзакцией; после остановки компонентов оставшийся файл указывает на незавершённую сессию.')}
-    if($Model.RepeatFailure){[void]$recommendations.Add('Тот же GUID повторно завис после очистки локального кэша. При исправном Host вероятен повторно загружаемый дефект центральной модели или сбой ModelService; создайте новую центральную модель через Revit/Save As после проверки отчёта.')}
-    if($cache.IssueCount-eq0-and$recommendations.Count-eq0){[void]$recommendations.Add('Явных файловых ошибок не найдено. Сопоставьте последний записанный файл со строками AutoSyncLog в LogContext.')}
-    [ordered]@{Created=(Get-Date).ToString('o');Guid=$Model.Guid;Name=$Model.Name;ModelPath=$Model.ModelPath;HostNode=$Model.HostNode;Status=$Model.Status;RepeatFailure=$Model.RepeatFailure;HangCount=$Model.HangCount;LastMessage=$Model.LastMessage;Cache=$cache;LogContext=$context;Recommendations=@($recommendations)}|ConvertTo-Json -Depth 9|Set-Content -LiteralPath $report -Encoding UTF8
-    [pscustomobject]@{Guid=$Model.Guid;Cache=$cache;LogContextCount=$context.Count;Recommendations=@($recommendations);ReportPath=$report}
+    $aclInfo=$null
+    try{$acl=Get-Acl -LiteralPath $Model.CachePath -ErrorAction Stop;$aclInfo=[pscustomobject]@{Owner=$acl.Owner;InheritanceProtected=$acl.AreAccessRulesProtected;Rules=@($acl.Access|ForEach-Object{[pscustomobject]@{Identity=[string]$_.IdentityReference;Type=[string]$_.AccessControlType;Rights=[string]$_.FileSystemRights;Inherited=$_.IsInherited}})}}catch{$aclInfo=[pscustomobject]@{Error=$_.Exception.Message}}
+    $hostCheck=$null
+    try{$node=Split-SynxHostNode ([string]$Model.HostNode);if($node.Address-and$node.Port){$hostCheck=Test-SynxHostEndpoint -Address $node.Address -Ports @($node.Port)}}catch{$hostCheck=[pscustomobject]@{Address=$Model.HostNode;Resolved=$false;AllPortsOpen=$false;ResolveError=$_.Exception.Message;Checks=@()}}
+    $zeroStreamLines=@($context|Where-Object{$_.Text-match'(?i)<[^>]*StreamLength>\s*0\s*</'})
+    $positiveStreamLines=@($context|Where-Object{$_.Text-match'(?i)<[^>]*StreamLength>\s*[1-9]\d*\s*</'})
+    $badDatabases=@($cache.DatabaseChecks|Where-Object{$_.Integrity-ne'ok'})
+    $unreadable=@($cache.Issues|Where-Object{$_.Type-in @('Unreadable','EnumerationError')})
+    $zeroFiles=@($cache.Issues|Where-Object{$_.Type-eq'ZeroLength'})
+    $aclRules=if($null-ne$aclInfo-and$aclInfo.PSObject.Properties['Rules']){@($aclInfo.Rules)}else{@()};$serviceAclPattern='(?i)SYSTEM|IIS_IUSRS|IIS AppPool|NETWORK SERVICE'
+    $serviceDenies=@($aclRules|Where-Object{$_.Type-eq'Deny'-and$_.Identity-match$serviceAclPattern});$serviceAllows=@($aclRules|Where-Object{$_.Type-eq'Allow'-and$_.Identity-match$serviceAclPattern})
+    $reason='Причина не подтверждена';$confidence='Низкая';$action='Сравнить отчёт с исправной моделью и повторить диагностику во время зависания.';$evidence=New-Object Collections.ArrayList
+    if($null-ne$hostCheck-and((-not$hostCheck.Resolved)-or(-not$hostCheck.AllPortsOpen))){$reason='Host или порт недоступен';$confidence='Высокая';$action='Исправить DNS/маршрут/порт до очистки кэша.';[void]$evidence.Add("Проверка HostNode неуспешна: $($Model.HostNode)")}
+    elseif($unreadable.Count){$reason='Файлы кэша недоступны для чтения';$confidence='Высокая';$action='После остановки AutoSync/IIS сравнить ACL с исправным GUID и восстановить наследование прав.';[void]$evidence.Add("Недоступных файлов или каталогов: $($unreadable.Count)")}
+    elseif($serviceDenies.Count){$reason='ACL запрещает доступ служебной учётной записи';$confidence='Высокая';$action='Сравнить ACL с исправным GUID и убрать только конфликтующее правило Deny после остановки компонентов.';[void]$evidence.Add("Запрещающих правил для SYSTEM/IIS/NETWORK SERVICE: $($serviceDenies.Count)")}
+    elseif($aclInfo.PSObject.Properties['InheritanceProtected']-and$aclInfo.InheritanceProtected-and$serviceAllows.Count-eq0){$reason='Кэш не наследует права служб';$confidence='Средняя';$action='После остановки компонентов восстановить наследование ACL выбранного GUID и сравнить с исправным каталогом.';[void]$evidence.Add('Наследование ACL отключено; разрешения SYSTEM/IIS/NETWORK SERVICE не найдены.')}
+    elseif($zeroFiles.Count){$reason='В кэше есть физически пустые файлы';$confidence='Высокая';$action='Выполнить точечный ремонт всего GUID; отдельные .dat/.rws не удалять.';[void]$evidence.Add("Файлов длиной 0 байт: $($zeroFiles.Count)")}
+    elseif($badDatabases.Count){
+        $locked=@($badDatabases|Where-Object{$_.Integrity-match'(?i)locked|busy|used by another process'})
+        if($locked.Count){$reason='Внутренняя база занята или сессия не завершена';$confidence='Средняя';$action='Остановить AutoSync/IIS и повторить диагностику. Если lock останется — выполнить точечный ремонт GUID.'}
+        else{$reason='Повреждена внутренняя SQLite-база кэша';$confidence='Высокая';$action='Выполнить точечный ремонт всего GUID из резервной копии.'}
+        [void]$evidence.Add("SQLite с ошибкой: $(@($badDatabases|ForEach-Object{[IO.Path]::GetFileName($_.Path)})-join', ')")
+    }
+    elseif($Model.RepeatFailure){$reason='Сбой повторно приходит после очистки';$confidence='Средняя';$action='Проверить чтение w3wp.exe через Process Monitor; если чтение успешно — пересохранить центральную модель штатно через Revit.';[void]$evidence.Add('Тот же GUID снова завис после успешного локального ремонта.')}
+    elseif($zeroStreamLines.Count-and-not$positiveStreamLines.Count){$reason='WCF показывает StreamLength=0';$confidence='Низкая';$action='Сравнить с исправной моделью и проверить реальные ReadFile процесса w3wp.exe; WCF-журнал потоковых сообщений содержит только заголовки.';[void]$evidence.Add("Строк StreamLength=0: $($zeroStreamLines.Count); положительных значений рядом: 0")}
+    elseif($Model.Status-eq'ЗАВИСАНИЕ'-and$cache.IdleMinutes-ne$null-and$cache.IdleMinutes-ge2){$reason='AutoSync перестал изменять кэш';$confidence='Средняя';$action='Проверить последний файл и контекст AutoSyncLog; затем определить ReadFile процесса w3wp.exe.';[void]$evidence.Add("Кэш не изменялся $($cache.IdleMinutes) мин.; последний файл: $(if($cache.NewestFiles.Count){$cache.NewestFiles[0].Path}else{'нет'})")}
+    elseif($Model.Status-eq'ЗАВИСАНИЕ'){$reason='AutoSync не завершает обработку модели';$confidence='Средняя';$action='Повторить диагностику через 2–3 минуты и проверить последний изменяемый файл.';[void]$evidence.Add("Строк threads are still not done: $($Model.HangCount)")}
+    if($cache.TransactionSidecars.Count){[void]$evidence.Add("Файлов journal/WAL/SHM: $($cache.TransactionSidecars.Count) (при работающем AutoSync это не обязательно ошибка)")}
+    if($zeroStreamLines.Count){[void]$evidence.Add("В контексте WCF есть StreamLength=0: $($zeroStreamLines.Count); само по себе это не доказывает передачу 0 байт")}
+    if($cache.NewestFiles.Count){[void]$evidence.Add("Последним изменён: $($cache.NewestFiles[0].Path), $($cache.NewestFiles[0].LastWriteTime)")}
+    $recommendations=@($action)
+    [ordered]@{Created=(Get-Date).ToString('o');Guid=$Model.Guid;Name=$Model.Name;ModelPath=$Model.ModelPath;HostNode=$Model.HostNode;Status=$Model.Status;RepeatFailure=$Model.RepeatFailure;HangCount=$Model.HangCount;LastMessage=$Model.LastMessage;Diagnosis=[ordered]@{Reason=$reason;Confidence=$confidence;Evidence=@($evidence);Action=$action};HostCheck=$hostCheck;Acl=$aclInfo;Wcf=[ordered]@{ZeroStreamLengthLines=$zeroStreamLines.Count;PositiveStreamLengthLines=$positiveStreamLines.Count};Cache=$cache;LogContext=$context;Recommendations=$recommendations}|ConvertTo-Json -Depth 10|Set-Content -LiteralPath $report -Encoding UTF8
+    [pscustomobject]@{Guid=$Model.Guid;Reason=$reason;Confidence=$confidence;Evidence=@($evidence);Action=$action;HostCheck=$hostCheck;Acl=$aclInfo;Cache=$cache;LogContextCount=$context.Count;Recommendations=$recommendations;ReportPath=$report}
 }
 
 function Get-SynxHistoryPath {
@@ -329,6 +355,20 @@ function Get-AcceleratorInventory {
         $item|Add-Member -NotePropertyName RepairCount -NotePropertyValue $repairs.Count
         $item|Add-Member -NotePropertyName RepeatFailure -NotePropertyValue $repeat
         $item|Add-Member -NotePropertyName RepeatText -NotePropertyValue $(if($repeat){'ПОВТОР'}else{''})
+        $matchingHostErrors=@($events|Where-Object{$_.Type-eq'HostResolution'-and$_.HostNode-and([string]$_.HostNode-eq[string]$item.HostNode)})
+        $diagnosis='Отклонений не найдено';$confidence='—';$evidence='Логи не содержат актуальной ошибки';$action='Наблюдение не требуется.'
+        if($matchingHostErrors.Count){$diagnosis='Host не разрешается';$confidence='Высокая';$evidence=[string]$matchingHostErrors[-1].Raw;$action='Проверить DNS/IP и доступность порта Host.'}
+        elseif($item.LastMessage-match'(?i)access.+denied|unauthorized'){$diagnosis='Отказ в доступе к файлам';$confidence='Высокая';$evidence=$item.LastMessage;$action='Запустить глубокую диагностику ACL и файлов кэша.'}
+        elseif($item.LastMessage-match'(?i)locked by another process|sharing violation'){$diagnosis='Файл удерживается процессом';$confidence='Высокая';$evidence=$item.LastMessage;$action='Определить удерживающий процесс и проверить состояние IIS/AutoSync.'}
+        elseif($repeat-and$item.Status-eq'ЗАВИСАНИЕ'){$diagnosis='Повтор после очистки кэша';$confidence='Средняя';$evidence="Тот же GUID снова завис; строк зависания: $($item.HangCount)";$action='Проверить Data_Sync, фактическое чтение файлов и центральную модель.'}
+        elseif($item.Status-eq'ЗАВИСАНИЕ'){$diagnosis='AutoSync не завершает обработку';$confidence='Средняя';$evidence="Повторяющихся строк threads are still not done: $($item.HangCount)";$action='Запустить глубокую диагностику выбранного GUID.'}
+        elseif($item.Status-eq'ОШИБКА'){$diagnosis='Ошибка AutoSync/ModelService';$confidence='Средняя';$evidence=$item.LastMessage;$action='Открыть подробный отчёт и контекст лога.'}
+        elseif($item.Status-eq'НЕТ КЭША'){$diagnosis='Кэш ещё не создан';$confidence='Высокая';$evidence='GUID присутствует в Host DB, каталог кэша отсутствует';$action='Открыть модель и повторить проверку.'}
+        elseif($item.Status-eq'БЕЗ ЗАПИСИ БД'){$diagnosis='Осиротевший каталог кэша';$confidence='Высокая';$evidence='Каталог GUID есть, привязки GUID → HostNode нет';$action='Проверить модель перед точечным ремонтом.'}
+        $item|Add-Member -NotePropertyName Diagnosis -NotePropertyValue $diagnosis
+        $item|Add-Member -NotePropertyName DiagnosisConfidence -NotePropertyValue $confidence
+        $item|Add-Member -NotePropertyName DiagnosisEvidence -NotePropertyValue $evidence
+        $item|Add-Member -NotePropertyName DiagnosisAction -NotePropertyValue $action
     }
     [pscustomobject]@{Instance=$Instance;Models=@($items|Sort-Object @{Expression={if($_.RepeatFailure){0}elseif($_.Status-eq'ЗАВИСАНИЕ'){1}elseif($_.Status-eq'ОШИБКА'){2}else{3}}},Name,Guid);Events=$events;DatabaseIntegrity=$dbIntegrity;StatusDatabaseIntegrity=$statusIntegrity;CacheStatus=$cacheStatus;ResolvedNames=$locations.Count;HistoryPath=$historyPath;HistoryStatus=$historyStatus}
 }

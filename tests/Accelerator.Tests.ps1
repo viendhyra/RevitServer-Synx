@@ -18,7 +18,7 @@ Describe 'GitHub bootstrap' {
     Add-Type -AssemblyName PresentationFramework
     $reader=New-Object Xml.XmlNodeReader $xaml
     $view=[Windows.Markup.XamlReader]::Load($reader)
-    foreach($name in @('ModelsGrid','ErrorsGrid','RepairButton','BatchRepairButton','CacheCheckButton','OldHostCombo','NewHostText','TestHostButton','MigrateHostButton','LoadHostNamesButton','OpenHistoryButton','RepairProgress','RepairDetails')){
+    foreach($name in @('ModelsGrid','ErrorsGrid','DiagnosisCard','DiagnosisTitleText','DiagnosisConfidenceText','DiagnosisEvidenceText','DiagnosisActionText','RepairButton','BatchRepairButton','CacheCheckButton','OpenDiagnosticButton','OldHostCombo','NewHostText','TestHostButton','MigrateHostButton','LoadHostNamesButton','OpenHistoryButton','RepairProgress','RepairDetails')){
       $xamlText|Should -Match ('x:Name="'+[regex]::Escape($name)+'"')
       $view.FindName($name)|Should -Not -BeNullOrEmpty
     }
@@ -79,6 +79,16 @@ Describe 'Cache file inspection' {
     $guid='11111111-2222-4333-8444-555555555555';$other='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';$log=Join-Path $TestDrive 'AutoSyncLog.log'
     @('before','Model: C:\Cache\'+$guid+'\Data','after','Model: C:\Cache\'+$other+'\Data')|Set-Content -LiteralPath $log -Encoding UTF8
     $context=@(Get-SynxGuidLogContext -Guid $guid -Paths @($log) -Before 1 -After 1);$context.Count|Should -Be 3;($context.Text-join' ')|Should -Match ([regex]::Escape($guid));($context.Text-join' ')|Should -Not -Match ([regex]::Escape($other))
+  }
+  It 'identifies a physical zero-byte cache file as a high-confidence cause' {
+    $guid='22222222-3333-4444-8555-666666666666';$cache=Join-Path $TestDrive "Cache\$guid";$reports=Join-Path $TestDrive 'diagnostics';New-Item -ItemType Directory -Path $cache -Force|Out-Null;[IO.File]::WriteAllBytes((Join-Path $cache 'history.1.dat'),[byte[]]@())
+    $model=[pscustomobject]@{Guid=$guid;Name='Broken.rvt';ModelPath='Project\Broken.rvt';HostNode='';Status='ЗАВИСАНИЕ';RepeatFailure=$false;HangCount=4;LastMessage='';CachePath=$cache}
+    $result=Test-SynxModelDiagnostics -Model $model -LogPaths @() -ReportDirectory $reports;$result.Reason|Should -Be 'В кэше есть физически пустые файлы';$result.Confidence|Should -Be 'Высокая';Test-Path -LiteralPath $result.ReportPath|Should -BeTrue
+  }
+  It 'treats StreamLength zero as a low-confidence WCF hypothesis, not proof' {
+    $guid='33333333-4444-4555-8666-777777777777';$cache=Join-Path $TestDrive "Cache\$guid";$reports=Join-Path $TestDrive 'wcf-diagnostics';$log=Join-Path $TestDrive 'WcfAutoSync.log';New-Item -ItemType Directory -Path $cache -Force|Out-Null;Set-Content -LiteralPath (Join-Path $cache 'history.1.dat') -Value 'not empty';@("Model: C:\Cache\$guid\Data",'<h:StreamLength>0</h:StreamLength>')|Set-Content -LiteralPath $log -Encoding UTF8
+    $model=[pscustomobject]@{Guid=$guid;Name='Wcf.rvt';ModelPath='Project\Wcf.rvt';HostNode='';Status='ЗАВИСАНИЕ';RepeatFailure=$false;HangCount=4;LastMessage='';CachePath=$cache}
+    $result=Test-SynxModelDiagnostics -Model $model -LogPaths @($log) -ReportDirectory $reports;$result.Reason|Should -Be 'WCF показывает StreamLength=0';$result.Confidence|Should -Be 'Низкая'
   }
 }
 Describe 'AutoSync log parser' {
