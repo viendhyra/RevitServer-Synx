@@ -6,6 +6,19 @@ Describe 'GitHub bootstrap' {
     $text=[Text.Encoding]::UTF8.GetString($bytes);@($text.ToCharArray()|Where-Object{[int]$_-gt127}).Count|Should -Be 0
     $tokens=$null;$errors=$null;[void][System.Management.Automation.Language.Parser]::ParseInput($text,[ref]$tokens,[ref]$errors);$errors.Count|Should -Be 0
   }
+  It 'parses the graphical application script and contains every required control' {
+    $scriptPath=Join-Path $PSScriptRoot '../RevitServer-Synx.ps1'
+    $text=[IO.File]::ReadAllText($scriptPath,[Text.Encoding]::UTF8)
+    $tokens=$null;$errors=$null
+    [void][System.Management.Automation.Language.Parser]::ParseInput($text,[ref]$tokens,[ref]$errors)
+    $errors.Count|Should -Be 0
+
+    [xml]$xaml=[IO.File]::ReadAllText((Join-Path $PSScriptRoot '../ui/MainWindow.xaml'),[Text.Encoding]::UTF8)
+    $xamlText=$xaml.OuterXml
+    foreach($name in @('ModelsGrid','ErrorsGrid','RepairButton','BatchRepairButton','RepairProgress','RepairDetails')){
+      $xamlText|Should -Match ('x:Name="'+[regex]::Escape($name)+'"')
+    }
+  }
 }
 Describe 'Model name mapping' {
   It 'converts a Revit SQLite GUID blob to the standard GUID form' {
