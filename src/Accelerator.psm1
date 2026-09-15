@@ -174,7 +174,7 @@ function Test-SynxCacheFiles {
     foreach($file in $allFiles){
         $count++;$bytes+=[int64]$file.Length;$kind='';$details=''
         if($file.Length-eq0){$kind='ZeroLength';$details='Файл нулевой длины'}
-        try{$stream=New-Object IO.FileStream($file.FullName,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete);try{if($file.Length-gt0){[void]$stream.ReadByte()}}finally{$stream.Dispose()}}catch{$kind='Unreadable';$details=$_.Exception.Message}
+        try{$share=[IO.FileShare]([int][IO.FileShare]::ReadWrite -bor [int][IO.FileShare]::Delete);$stream=[IO.File]::Open($file.FullName,[IO.FileMode]::Open,[IO.FileAccess]::Read,$share);try{if($file.Length-gt0){[void]$stream.ReadByte()}}finally{$stream.Dispose()}}catch{$kind='Unreadable';$details=$_.Exception.Message}
         if($kind){[void]$issues.Add([pscustomobject]@{Type=$kind;Path=$file.FullName;Length=$file.Length;LastWriteTime=$file.LastWriteTime;Details=$details})}
     }
     foreach($db in @($allFiles|Where-Object{$_.Extension-eq'.db3'})){
