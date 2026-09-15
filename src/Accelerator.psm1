@@ -214,7 +214,7 @@ function Test-SynxModelDiagnostics {
     $aclInfo=$null
     try{$acl=Get-Acl -LiteralPath $Model.CachePath -ErrorAction Stop;$aclInfo=[pscustomobject]@{Owner=$acl.Owner;InheritanceProtected=$acl.AreAccessRulesProtected;Rules=@($acl.Access|ForEach-Object{[pscustomobject]@{Identity=[string]$_.IdentityReference;Type=[string]$_.AccessControlType;Rights=[string]$_.FileSystemRights;Inherited=$_.IsInherited}})}}catch{$aclInfo=[pscustomobject]@{Error=$_.Exception.Message}}
     $hostCheck=$null
-    try{$node=Split-SynxHostNode ([string]$Model.HostNode);if($node.Address-and$node.Port){$hostCheck=Test-SynxHostEndpoint -Address $node.Address -Ports @($node.Port)}}catch{$hostCheck=[pscustomobject]@{Address=$Model.HostNode;Resolved=$false;AllPortsOpen=$false;ResolveError=$_.Exception.Message;Checks=@()}}
+    try{if([string]$Model.HostNode){$node=Split-SynxHostNode ([string]$Model.HostNode);if($node.Address-and$node.Port){$hostCheck=Test-SynxHostEndpoint -Address $node.Address -Ports @($node.Port)}}}catch{$hostCheck=[pscustomobject]@{Address=$Model.HostNode;Resolved=$false;AllPortsOpen=$false;ResolveError=$_.Exception.Message;Checks=@()}}
     $zeroStreamLines=@($context|Where-Object{$_.Text-match'(?i)<[^>]*StreamLength>\s*0\s*</'})
     $positiveStreamLines=@($context|Where-Object{$_.Text-match'(?i)<[^>]*StreamLength>\s*[1-9]\d*\s*</'})
     $badDatabases=@($cache.DatabaseChecks|Where-Object{$_.Integrity-ne'ok'})
