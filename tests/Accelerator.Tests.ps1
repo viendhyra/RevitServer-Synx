@@ -18,6 +18,8 @@ Describe 'Model name mapping' {
   }
 }
 Describe 'AutoSync log parser' {
+  It 'handles models with no log events' {$state=Get-SynxModelEventState -Events @();$state.Hangs.Count|Should -Be 0;$state.Errors.Count|Should -Be 0;$state.Last.Count|Should -Be 0}
+  It 'handles an empty log path list' {@(Get-AutoSyncLogAnalysis -Paths @()).Count|Should -Be 0}
   It 'extracts a stuck cache GUID and loop number' {$line='2026-09-15 00:06:37,750 INFO TID(6) LOGGER(ServerLogger) MSG(Comment: Loop 453 : 1 threads are still not done for Model: C:\ProgramData\Autodesk\Revit Server 2022\Cache\11111111-2222-4333-8444-555555555555\Data)';$event=ConvertFrom-AutoSyncLogLine $line;$event.Type|Should -Be 'StuckThread';$event.Guid|Should -Be '11111111-2222-4333-8444-555555555555';$event.Loop|Should -Be 453}
   It 'classifies host lookup failures' {$event=ConvertFrom-AutoSyncLogLine '2026-09-15 00:26:42,532 INFO MSG(Comment: Failed to get IP addresses for 203.0.113.10:36942: No such host is known)';$event.Type|Should -Be 'HostResolution';$event.Level|Should -Be 'WARN';$event.HostNode|Should -Be '203.0.113.10:36942'}
   It 'recognizes successful synchronization' {(ConvertFrom-AutoSyncLogLine '2026-09-15 00:26:43,208 INFO MSG(Comment: Data is up-to-date with central.)').Level|Should -Be 'OK'}

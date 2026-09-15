@@ -86,9 +86,13 @@ Revit Server хранит в локальной базе Accelerator GUID и Hos
 
 ## Резервные копии
 
+Для каждой версии Revit Server создаётся отдельная папка рядом с `Cache`, `Logs` и `Projects`:
+
 ```text
-%ProgramData%\RevitServer-Synx\Repair_<GUID>_<дата>
+%ProgramData%\Autodesk\Revit Server 2022\SynxBackup\Repair_<GUID>_<дата>\DatabaseBackup
 ```
+
+В `DatabaseBackup` сохраняются только файлы SQLite (`.db3`, journal/WAL/SHM). Кэш модели в эту папку не копируется.
 
 Карантин располагается рядом с экземпляром Revit Server:
 

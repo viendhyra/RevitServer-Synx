@@ -67,7 +67,10 @@ function ConvertFrom-AutoSyncLogLine {
 function Get-AutoSyncLogAnalysis {
     param([string[]]$Paths,[ValidateRange(100,200000)][int]$Tail=30000)
     $events=New-Object Collections.ArrayList
-    foreach($path in @($Paths|Where-Object{$_ -and (Test-Path -LiteralPath $_ -PathType Leaf)}|Sort-Object -Unique)){
+    $seen=@{}
+    foreach($path in @($Paths)){
+        if((-not $path) -or (-not (Test-Path -LiteralPath $path -PathType Leaf)) -or $seen.ContainsKey([string]$path)){continue}
+        $seen[[string]$path]=$true
         try{foreach($line in @(Get-Content -LiteralPath $path -Tail $Tail -ErrorAction Stop)){$event=ConvertFrom-AutoSyncLogLine ([string]$line);if($event.Type-ne'Info'){$event|Add-Member -NotePropertyName LogPath -NotePropertyValue $path;[void]$events.Add($event)}}}catch{[void]$events.Add([pscustomobject]@{Time=Get-Date;Level='FAIL';Type='LogRead';Guid='';HostNode='';Loop=0;Threads=0;Message=$_.Exception.Message;Raw='';LogPath=$path})}
     };@($events)
 }
@@ -99,8 +102,10 @@ function ConvertFrom-SynxGuidHex {
 
 function Get-SynxModelLocationMap {
     param([string[]]$Paths)
-    $result=@{}
-    foreach($path in @($Paths|Where-Object{$_-and(Test-Path -LiteralPath $_ -PathType Leaf)}|Sort-Object -Unique)){
+    $result=@{};$seen=@{}
+    foreach($path in @($Paths)){
+        if((-not $path) -or (-not (Test-Path -LiteralPath $path -PathType Leaf)) -or $seen.ContainsKey([string]$path)){continue}
+        $seen[[string]$path]=$true
         try{
             $sql='SELECT typeof(ModelIdentityGUID) AS GuidType, hex(ModelIdentityGUID) AS GuidHex, CAST(ModelIdentityGUID AS TEXT) AS GuidText, ModelPath, ModelNormalizedPath FROM ModelStorageTable;'
             foreach($row in @(Invoke-SynxSqliteQuery $path $sql)){
@@ -115,22 +120,27 @@ function Get-SynxModelLocationMap {
 
 function Get-SynxModelEventState {
     param([object[]]$Events)
-    $current=New-Object Collections.ArrayList
+    $current=New-Object Collections.ArrayList;$dated=New-Object Collections.ArrayList
     foreach($event in @($Events)){
+        if($null-eq$event){continue}
+        if($event.Time){[void]$dated.Add($event)}
         if($event.Type-eq'UpToDate'){$current.Clear();continue}
         [void]$current.Add($event)
     }
+    $hangs=@();$errors=@()
+    foreach($event in @($current)){if($event.Type-eq'StuckThread'){$hangs+=,$event}elseif($event.Type-eq'Error'){$errors+=,$event}}
+    $last=if($dated.Count){@($dated|Sort-Object Time|Select-Object -Last 1)}else{@()}
     [pscustomobject]@{
-        Hangs=@($current|Where-Object Type -eq StuckThread)
-        Errors=@($current|Where-Object Type -eq Error)
-        Last=@($Events|Where-Object Time|Sort-Object Time|Select-Object -Last 1)
+        Hangs=@($hangs)
+        Errors=@($errors)
+        Last=@($last)
     }
 }
 
 function Get-AcceleratorInventory {
     param([Parameter(Mandatory)]$Instance,[ValidateRange(100,200000)][int]$LogTail=30000)
-    $events=@(Get-AutoSyncLogAnalysis @($Instance.LogPaths) $LogTail);$byGuid=@{};$locations=Get-SynxModelLocationMap @($Instance.LocationDatabases)
-    foreach($event in @($events|Where-Object Guid)){if(-not$byGuid.ContainsKey($event.Guid)){$byGuid[$event.Guid]=New-Object Collections.ArrayList};[void]$byGuid[$event.Guid].Add($event)}
+    $events=@(Get-AutoSyncLogAnalysis -Paths @($Instance.LogPaths) -Tail $LogTail);$byGuid=@{};$locations=Get-SynxModelLocationMap -Paths @($Instance.LocationDatabases)
+    foreach($event in @($events)){if(($null-eq$event) -or (-not $event.Guid)){continue};if(-not$byGuid.ContainsKey($event.Guid)){$byGuid[$event.Guid]=New-Object Collections.ArrayList};[void]$byGuid[$event.Guid].Add($event)}
     $rows=@();$dbIntegrity='missing'
     if(Test-Path -LiteralPath $Instance.HostDatabase -PathType Leaf){$dbIntegrity=Get-SynxSqliteIntegrity $Instance.HostDatabase;if($dbIntegrity-eq'ok'){$rows=@(Invoke-SynxSqliteQuery $Instance.HostDatabase 'SELECT lower(ModelIdentityGUID) AS Guid, HostNode FROM HostNodeForCachedModels ORDER BY ModelIdentityGUID;')}}
     $statusIntegrity='missing';$cacheStatus=''
@@ -178,7 +188,7 @@ function Set-SynxRuntimeState {
 
 function Invoke-AcceleratorModelRepair {
     [CmdletBinding(SupportsShouldProcess=$true,ConfirmImpact='High')]
-    param([Parameter(Mandatory)]$Model,[Parameter(Mandatory)][string]$OutputRoot,[scriptblock]$ProgressCallback)
+    param([Parameter(Mandatory)]$Model,[scriptblock]$ProgressCallback)
     function Publish-RepairProgress([int]$Percent,[string]$Message){if($ProgressCallback){&$ProgressCallback $Percent $Message}}
 
     Publish-RepairProgress 2 'Проверка выбранной модели'
@@ -190,7 +200,8 @@ function Invoke-AcceleratorModelRepair {
     if(-not$PSCmdlet.ShouldProcess($guid,'Точечный ремонт кэша Accelerator')){return [pscustomobject]@{Status='Skipped';Guid=$guid;Message='Отменено'}}
 
     $stamp=Get-Date -Format yyyy-MM-dd_HHmmss
-    $root=Join-Path $OutputRoot "Repair_${guid}_$stamp"
+    $synxBackupRoot=Join-Path ([string]$Model.InstanceRoot) 'SynxBackup'
+    $root=Join-Path $synxBackupRoot "Repair_${guid}_$stamp"
     $backup=Join-Path $root DatabaseBackup
     $qroot=Join-Path ([string]$Model.InstanceRoot) SynxQuarantine
     $quarantine=Join-Path $qroot "${guid}_$stamp"
