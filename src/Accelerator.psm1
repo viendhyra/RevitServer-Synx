@@ -178,12 +178,41 @@ function Set-SynxRuntimeState {
     param($Targets,[ValidateSet('Stop','Start')]$Action)
     if($Targets.Pools.Count){Import-Module WebAdministration -ErrorAction Stop}
     if($Action-eq'Stop'){
-        foreach($s in @($Targets.Services)){if([string]$s.State-eq'Running'){Stop-Service $s.Name -Force -ErrorAction Stop;Wait-SynxServiceState $s.Name 'Stopped'}}
-        foreach($p in @($Targets.Pools)){if($p.State-eq'Started'){Stop-WebAppPool $p.Name;for($i=0;$i-lt45;$i++){if((Get-WebAppPoolState $p.Name).Value-eq'Stopped'){break};Start-Sleep 1};if((Get-WebAppPoolState $p.Name).Value-ne'Stopped'){throw "IIS-пул $($p.Name) не остановился."}}}
+        foreach($s in @($Targets.Services)){if(([string]$s.State-eq'Running') -and ([string](Get-Service $s.Name).Status-ne'Stopped')){Stop-Service $s.Name -Force -ErrorAction Stop;Wait-SynxServiceState $s.Name 'Stopped'}}
+        foreach($p in @($Targets.Pools)){if($p.State-eq'Started'){$current=[string](Get-WebAppPoolState $p.Name).Value;if($current-ne'Stopped'){Stop-WebAppPool $p.Name;for($i=0;$i-lt45;$i++){if((Get-WebAppPoolState $p.Name).Value-eq'Stopped'){break};Start-Sleep 1};if((Get-WebAppPoolState $p.Name).Value-ne'Stopped'){throw "IIS-пул $($p.Name) не остановился."}}}}
     }else{
         foreach($p in @($Targets.Pools)){if($p.State-eq'Started'-and(Get-WebAppPoolState $p.Name).Value-ne'Started'){Start-WebAppPool $p.Name;for($i=0;$i-lt45;$i++){if((Get-WebAppPoolState $p.Name).Value-eq'Started'){break};Start-Sleep 1};if((Get-WebAppPoolState $p.Name).Value-ne'Started'){throw "IIS-пул $($p.Name) не запустился."}}}
         foreach($s in @($Targets.Services)){if([string]$s.State-eq'Running'-and(Get-Service $s.Name).Status-ne'Running'){Start-Service $s.Name;Wait-SynxServiceState $s.Name 'Running'}}
     }
+}
+
+function Set-SynxCacheRepairAccess {
+    param([Parameter(Mandatory)][string]$Path)
+    if(-not(Test-Path -LiteralPath $Path -PathType Container)){throw "Каталог кэша не найден: $Path"}
+    $takeown=Join-Path $env:SystemRoot 'System32\takeown.exe';$icacls=Join-Path $env:SystemRoot 'System32\icacls.exe'
+    & $takeown '/F' $Path '/A' '/R' '/D' 'Y'|Out-Null
+    if($LASTEXITCODE-ne0){throw "takeown не смог получить доступ к кэшу (Code $LASTEXITCODE)."}
+    & $icacls $Path '/grant' '*S-1-5-32-544:(OI)(CI)F' '/T' '/C' '/Q'|Out-Null
+    if($LASTEXITCODE-ne0){throw "icacls не смог выдать права на кэш (Code $LASTEXITCODE)."}
+}
+
+function Move-SynxCacheDirectory {
+    param([Parameter(Mandatory)][string]$Source,[Parameter(Mandatory)][string]$Destination,[scriptblock]$ProgressCallback)
+    if(-not(Test-Path -LiteralPath $Source -PathType Container)){return $false}
+    if(Test-Path -LiteralPath $Destination){throw "Папка карантина уже существует: $Destination"}
+    $parent=Split-Path -Parent $Destination;if(-not(Test-Path -LiteralPath $parent)){New-Item -ItemType Directory -Path $parent -Force|Out-Null}
+    $accessFixed=$false;$lastError=''
+    for($attempt=1;$attempt-le8;$attempt++){
+        try{[IO.Directory]::Move($Source,$Destination);return $true}catch{
+            $lastError=$_.Exception.Message
+            if(($attempt-ge3) -and (-not$accessFixed) -and (Test-Path -LiteralPath $Source -PathType Container)){
+                if($ProgressCallback){&$ProgressCallback 58 'Восстановление прав на выбранный кэш GUID'}
+                Set-SynxCacheRepairAccess $Source;$accessFixed=$true
+            }
+            if($attempt-lt8){Start-Sleep -Seconds 1}
+        }
+    }
+    throw "Не удалось переместить кэш после 8 попыток: $lastError"
 }
 
 function Invoke-AcceleratorModelRepair {
@@ -234,7 +263,7 @@ function Invoke-AcceleratorModelRepair {
         Publish-RepairProgress 48 'Бэкап баз проверен по SHA-256'
 
         Publish-RepairProgress 55 'Удаление кэша GUID из активной системы'
-        if(Test-Path -LiteralPath $Model.CachePath -PathType Container){Move-Item -LiteralPath $Model.CachePath -Destination $quarantine -Force;$moved=$true}
+        if(Test-Path -LiteralPath $Model.CachePath -PathType Container){$moved=Move-SynxCacheDirectory -Source $Model.CachePath -Destination $quarantine -ProgressCallback $ProgressCallback}
 
         Publish-RepairProgress 65 'Удаление привязки GUID из локальной базы'
         if(Test-Path -LiteralPath $Model.HostDatabase){Invoke-SynxSqliteExecute $Model.HostDatabase "BEGIN IMMEDIATE; DELETE FROM HostNodeForCachedModels WHERE lower(ModelIdentityGUID)=lower('$guid'); COMMIT;";$changed=$true}
@@ -256,7 +285,7 @@ function Invoke-AcceleratorModelRepair {
             "`$ErrorActionPreference='Stop'",
             "# Перед откатом остановите AutoSync и IIS-пул Revit Server $($Model.Year).",
             "Copy-Item -LiteralPath '$($dbBackupPath.Replace("'","''"))' -Destination '$(([string]$Model.HostDatabase).Replace("'","''"))' -Force",
-            "if(Test-Path -LiteralPath '$($quarantine.Replace("'","''"))'){Move-Item -LiteralPath '$($quarantine.Replace("'","''"))' -Destination '$(([string]$Model.CachePath).Replace("'","''"))' -Force}"
+            "if(Test-Path -LiteralPath '$($quarantine.Replace("'","''"))'){[IO.Directory]::Move('$($quarantine.Replace("'","''"))','$(([string]$Model.CachePath).Replace("'","''"))')}"
         )|Set-Content (Join-Path $root Rollback.ps1) -Encoding UTF8
 
         Publish-RepairProgress 100 'Готово: локальные данные модели очищены'
@@ -267,7 +296,7 @@ function Invoke-AcceleratorModelRepair {
             Publish-RepairProgress 80 'Ошибка: выполняется безопасный откат'
             Set-SynxRuntimeState $targets Stop
             if($changed){$copy=Join-Path $backup ([IO.Path]::GetFileName([string]$Model.HostDatabase));if(Test-Path $copy){Copy-Item -LiteralPath $copy -Destination $Model.HostDatabase -Force}}
-            if($moved-and(Test-Path $quarantine)-and-not(Test-Path $Model.CachePath)){Move-Item -LiteralPath $quarantine -Destination $Model.CachePath -Force}
+            if($moved-and(Test-Path $quarantine)-and-not(Test-Path $Model.CachePath)){[IO.Directory]::Move([string]$quarantine,[string]$Model.CachePath)}
             Set-SynxRuntimeState $targets Start
             Publish-RepairProgress 100 'Откат завершён'
         }catch{$errorText+="; откат: $($_.Exception.Message)"}
@@ -276,4 +305,4 @@ function Invoke-AcceleratorModelRepair {
     }
 }
 
-Export-ModuleMember -Function Initialize-SynxSqlite,Invoke-SynxSqliteQuery,Invoke-SynxSqliteExecute,Get-SynxSqliteIntegrity,ConvertFrom-AutoSyncLogLine,Get-AutoSyncLogAnalysis,Find-AutoSyncLogs,Get-RevitAcceleratorInstances,ConvertFrom-SynxGuidHex,Get-SynxModelLocationMap,Get-SynxModelEventState,Get-AcceleratorInventory,Test-SynxAdministrator,Get-AcceleratorRepairTargets,New-AcceleratorRepairPreview,Invoke-AcceleratorModelRepair
+Export-ModuleMember -Function Initialize-SynxSqlite,Invoke-SynxSqliteQuery,Invoke-SynxSqliteExecute,Get-SynxSqliteIntegrity,ConvertFrom-AutoSyncLogLine,Get-AutoSyncLogAnalysis,Find-AutoSyncLogs,Get-RevitAcceleratorInstances,ConvertFrom-SynxGuidHex,Get-SynxModelLocationMap,Get-SynxModelEventState,Get-AcceleratorInventory,Test-SynxAdministrator,Get-AcceleratorRepairTargets,New-AcceleratorRepairPreview,Set-SynxCacheRepairAccess,Move-SynxCacheDirectory,Invoke-AcceleratorModelRepair

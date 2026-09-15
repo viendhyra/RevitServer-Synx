@@ -17,6 +17,14 @@ Describe 'Model name mapping' {
     $map=Get-SynxModelLocationMap @($db);$map['0f671aad-ae8a-452b-8b8d-467ebf402643'].Name|Should -Be 'Named_Model.rvt';$map['0f671aad-ae8a-452b-8b8d-467ebf402643'].ModelPath|Should -Be 'Project\Named_Model.rvt'
   }
 }
+Describe 'Cache quarantine move' {
+  It 'moves the selected GUID directory atomically with its Data folder' {
+    $source=Join-Path $TestDrive 'Cache\11111111-2222-4333-8444-555555555555';$destination=Join-Path $TestDrive 'SynxQuarantine\11111111-2222-4333-8444-555555555555_test'
+    New-Item -ItemType Directory -Path (Join-Path $source 'Data') -Force|Out-Null;Set-Content -LiteralPath (Join-Path $source 'Data\sample.bin') -Value 'test'
+    Move-SynxCacheDirectory -Source $source -Destination $destination|Should -BeTrue
+    Test-Path -LiteralPath $source|Should -BeFalse;Test-Path -LiteralPath (Join-Path $destination 'Data\sample.bin')|Should -BeTrue
+  }
+}
 Describe 'AutoSync log parser' {
   It 'handles models with no log events' {$state=Get-SynxModelEventState -Events @();$state.Hangs.Count|Should -Be 0;$state.Errors.Count|Should -Be 0;$state.Last.Count|Should -Be 0}
   It 'handles an empty log path list' {@(Get-AutoSyncLogAnalysis -Paths @()).Count|Should -Be 0}
