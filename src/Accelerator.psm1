@@ -118,11 +118,62 @@ function Get-SynxModelLocationMap {
     $result
 }
 
+function Get-SynxHistoryPath {
+    param([Parameter(Mandatory)][string]$InstanceRoot)
+    Join-Path (Join-Path $InstanceRoot 'SynxBackup') 'SynxIncidentHistory.jsonl'
+}
+
+function Read-SynxIncidentHistory {
+    param([Parameter(Mandatory)][string]$InstanceRoot)
+    $path=Get-SynxHistoryPath $InstanceRoot
+    if(-not(Test-Path -LiteralPath $path -PathType Leaf)){return @()}
+    $result=New-Object Collections.ArrayList
+    foreach($line in @(Get-Content -LiteralPath $path -ErrorAction SilentlyContinue)){
+        if(-not$line){continue}
+        try{$record=$line|ConvertFrom-Json -ErrorAction Stop;if($record.Guid){[void]$result.Add($record)}}catch{}
+    }
+    @($result)
+}
+
+function Write-SynxIncidentHistory {
+    param(
+        [Parameter(Mandatory)][string]$InstanceRoot,
+        [Parameter(Mandatory)][ValidateSet('FailureDetected','RepairSuccess','RepairFailed')][string]$Type,
+        [Parameter(Mandatory)][string]$Guid,
+        [string]$Name='',
+        [string]$ModelPath='',
+        [string]$Status='',
+        [int]$HangCount=0,
+        [int]$ErrorCount=0,
+        [Nullable[datetime]]$EventTime,
+        [string]$EpisodeKey='',
+        [string]$ActionRoot='',
+        [string]$Message=''
+    )
+    $directory=Join-Path $InstanceRoot 'SynxBackup';if(-not(Test-Path -LiteralPath $directory)){New-Item -ItemType Directory -Path $directory -Force|Out-Null}
+    $path=Get-SynxHistoryPath $InstanceRoot
+    $record=[ordered]@{Schema=1;RecordedAt=(Get-Date).ToString('o');Type=$Type;Guid=$Guid.ToLowerInvariant();Name=$Name;ModelPath=$ModelPath;Status=$Status;HangCount=$HangCount;ErrorCount=$ErrorCount;EventTime=if($EventTime){([datetime]$EventTime).ToString('o')}else{''};EpisodeKey=$EpisodeKey;ActionRoot=$ActionRoot;Message=$Message}
+    ($record|ConvertTo-Json -Compress -Depth 4)|Add-Content -LiteralPath $path -Encoding UTF8
+    [pscustomobject]$record
+}
+
+function Get-SynxLatestRepairTime {
+    param([object[]]$History,[Parameter(Mandatory)][string]$Guid)
+    $latest=$null
+    foreach($record in @($History)){
+        if(($null-eq$record) -or ([string]$record.Guid -ne $Guid) -or ([string]$record.Type -ne 'RepairSuccess')){continue}
+        try{$time=[datetime]$record.RecordedAt;if(($null-eq$latest) -or ($time-gt$latest)){$latest=$time}}catch{}
+    }
+    $latest
+}
+
 function Get-SynxModelEventState {
-    param([object[]]$Events)
+    param([object[]]$Events,[Nullable[datetime]]$After)
     $current=New-Object Collections.ArrayList;$dated=New-Object Collections.ArrayList
-    foreach($event in @($Events)){
+    $ordered=@($Events|Where-Object{$null-ne$_}|Sort-Object @{Expression={if($_.Time){[datetime]$_.Time}else{[datetime]::MinValue}}})
+    foreach($event in $ordered){
         if($null-eq$event){continue}
+        if(($null-ne$After) -and $event.Time -and ([datetime]$event.Time -le [datetime]$After)){continue}
         if($event.Time){[void]$dated.Add($event)}
         if($event.Type-eq'UpToDate'){$current.Clear();continue}
         [void]$current.Add($event)
@@ -130,16 +181,19 @@ function Get-SynxModelEventState {
     $hangs=@();$errors=@()
     foreach($event in @($current)){if($event.Type-eq'StuckThread'){$hangs+=,$event}elseif($event.Type-eq'Error'){$errors+=,$event}}
     $last=if($dated.Count){@($dated|Sort-Object Time|Select-Object -Last 1)}else{@()}
+    $firstFailure=@(@($hangs)+@($errors)|Where-Object{$_.Time}|Sort-Object Time|Select-Object -First 1)
     [pscustomobject]@{
         Hangs=@($hangs)
         Errors=@($errors)
         Last=@($last)
+        FirstFailure=@($firstFailure)
     }
 }
 
 function Get-AcceleratorInventory {
     param([Parameter(Mandatory)]$Instance,[ValidateRange(100,200000)][int]$LogTail=30000)
     $events=@(Get-AutoSyncLogAnalysis -Paths @($Instance.LogPaths) -Tail $LogTail);$byGuid=@{};$locations=Get-SynxModelLocationMap -Paths @($Instance.LocationDatabases)
+    $history=@(Read-SynxIncidentHistory -InstanceRoot $Instance.Root);$historyPath=Get-SynxHistoryPath $Instance.Root;$historyStatus='ok'
     foreach($event in @($events)){if(($null-eq$event) -or (-not $event.Guid)){continue};if(-not$byGuid.ContainsKey($event.Guid)){$byGuid[$event.Guid]=New-Object Collections.ArrayList};[void]$byGuid[$event.Guid].Add($event)}
     $rows=@();$dbIntegrity='missing'
     if(Test-Path -LiteralPath $Instance.HostDatabase -PathType Leaf){$dbIntegrity=Get-SynxSqliteIntegrity $Instance.HostDatabase;if($dbIntegrity-eq'ok'){$rows=@(Invoke-SynxSqliteQuery $Instance.HostDatabase 'SELECT lower(ModelIdentityGUID) AS Guid, HostNode FROM HostNodeForCachedModels ORDER BY ModelIdentityGUID;')}}
@@ -147,23 +201,60 @@ function Get-AcceleratorInventory {
     if(Test-Path -LiteralPath $Instance.StatusDatabase -PathType Leaf){$statusIntegrity=Get-SynxSqliteIntegrity $Instance.StatusDatabase;if($statusIntegrity-eq'ok'){$s=@(Invoke-SynxSqliteQuery $Instance.StatusDatabase 'SELECT CacheStatus FROM CacheStatus LIMIT 1;')|Select-Object -First 1;if($null-ne$s){$cacheStatus=[string]$s.CacheStatus}}}
     $known=@{};$items=New-Object Collections.ArrayList
     foreach($row in $rows){
-        $guid=[string]$row.Guid;$known[$guid]=$true;$me=if($byGuid.ContainsKey($guid)){@($byGuid[$guid])}else{@()};$eventState=Get-SynxModelEventState $me;$hangs=@($eventState.Hangs);$errors=@($eventState.Errors);$last=@($eventState.Last);$lastTime=if($last.Count){$last[0].Time}else{$null};$folder=Join-Path $Instance.CachePath $guid;$location=if($locations.ContainsKey($guid)){$locations[$guid]}else{$null}
+        $guid=[string]$row.Guid;$known[$guid]=$true;$me=if($byGuid.ContainsKey($guid)){@($byGuid[$guid])}else{@()};$repairTime=Get-SynxLatestRepairTime -History $history -Guid $guid;$eventState=Get-SynxModelEventState $me -After $repairTime;$hangs=@($eventState.Hangs);$errors=@($eventState.Errors);$last=@($eventState.Last);$first=@($eventState.FirstFailure);$lastTime=if($last.Count){$last[0].Time}else{$null};$firstTime=if($first.Count){$first[0].Time}else{$null};$lastMessage=if($last.Count){[string]$last[0].Raw}else{''};$folder=Join-Path $Instance.CachePath $guid;$location=if($locations.ContainsKey($guid)){$locations[$guid]}else{$null}
         $status=if($hangs.Count-ge3){'ЗАВИСАНИЕ'}elseif($errors.Count){'ОШИБКА'}elseif(-not(Test-Path -LiteralPath $folder -PathType Container)){'НЕТ КЭША'}else{'OK'}
-        [void]$items.Add([pscustomobject]@{Name=if($location){$location.Name}else{'—'};ModelPath=if($location){$location.ModelPath}else{''};Guid=$guid;HostNode=[string]$row.HostNode;Year=$Instance.Year;Status=$status;HangCount=$hangs.Count;ErrorCount=$errors.Count;LastEvent=$lastTime;CacheExists=[bool](Test-Path -LiteralPath $folder -PathType Container);CachePath=$folder;InstanceRoot=$Instance.Root;HostDatabase=$Instance.HostDatabase;StatusDatabase=$Instance.StatusDatabase})
+        [void]$items.Add([pscustomobject]@{Name=if($location){$location.Name}else{'—'};ModelPath=if($location){$location.ModelPath}else{''};Guid=$guid;HostNode=[string]$row.HostNode;Year=$Instance.Year;Status=$status;HangCount=$hangs.Count;ErrorCount=$errors.Count;LastEvent=$lastTime;EpisodeStart=$firstTime;LastMessage=$lastMessage;CacheExists=[bool](Test-Path -LiteralPath $folder -PathType Container);CachePath=$folder;InstanceRoot=$Instance.Root;HostDatabase=$Instance.HostDatabase;StatusDatabase=$Instance.StatusDatabase})
     }
-    if(Test-Path -LiteralPath $Instance.CachePath){foreach($dir in @(Get-ChildItem -LiteralPath $Instance.CachePath -Directory -ErrorAction SilentlyContinue|Where-Object Name -match '^[0-9a-fA-F-]{36}$')){$guid=$dir.Name.ToLowerInvariant();if($known.ContainsKey($guid)){continue};$me=if($byGuid.ContainsKey($guid)){@($byGuid[$guid])}else{@()};$eventState=Get-SynxModelEventState $me;$hangs=@($eventState.Hangs);$errors=@($eventState.Errors);$last=@($eventState.Last);$status=if($hangs.Count-ge3){'ЗАВИСАНИЕ'}elseif($errors.Count){'ОШИБКА'}else{'БЕЗ ЗАПИСИ БД'};$location=if($locations.ContainsKey($guid)){$locations[$guid]}else{$null};[void]$items.Add([pscustomobject]@{Name=if($location){$location.Name}else{'—'};ModelPath=if($location){$location.ModelPath}else{''};Guid=$guid;HostNode='';Year=$Instance.Year;Status=$status;HangCount=$hangs.Count;ErrorCount=$errors.Count;LastEvent=if($last.Count){$last[0].Time}else{$null};CacheExists=$true;CachePath=$dir.FullName;InstanceRoot=$Instance.Root;HostDatabase=$Instance.HostDatabase;StatusDatabase=$Instance.StatusDatabase})}}
-    [pscustomobject]@{Instance=$Instance;Models=@($items|Sort-Object @{Expression={if($_.Status-eq'ЗАВИСАНИЕ'){0}elseif($_.Status-eq'ОШИБКА'){1}else{2}}},Name,Guid);Events=$events;DatabaseIntegrity=$dbIntegrity;StatusDatabaseIntegrity=$statusIntegrity;CacheStatus=$cacheStatus;ResolvedNames=$locations.Count}
+    if(Test-Path -LiteralPath $Instance.CachePath){
+        foreach($dir in @(Get-ChildItem -LiteralPath $Instance.CachePath -Directory -ErrorAction SilentlyContinue|Where-Object Name -match '^[0-9a-fA-F-]{36}$')){
+            $guid=$dir.Name.ToLowerInvariant();if($known.ContainsKey($guid)){continue}
+            $me=if($byGuid.ContainsKey($guid)){@($byGuid[$guid])}else{@()};$repairTime=Get-SynxLatestRepairTime -History $history -Guid $guid;$eventState=Get-SynxModelEventState $me -After $repairTime;$hangs=@($eventState.Hangs);$errors=@($eventState.Errors);$last=@($eventState.Last);$first=@($eventState.FirstFailure)
+            $status=if($hangs.Count-ge3){'ЗАВИСАНИЕ'}elseif($errors.Count){'ОШИБКА'}else{'БЕЗ ЗАПИСИ БД'};$location=if($locations.ContainsKey($guid)){$locations[$guid]}else{$null}
+            [void]$items.Add([pscustomobject]@{Name=if($location){$location.Name}else{'—'};ModelPath=if($location){$location.ModelPath}else{''};Guid=$guid;HostNode='';Year=$Instance.Year;Status=$status;HangCount=$hangs.Count;ErrorCount=$errors.Count;LastEvent=if($last.Count){$last[0].Time}else{$null};EpisodeStart=if($first.Count){$first[0].Time}else{$null};LastMessage=if($last.Count){[string]$last[0].Raw}else{''};CacheExists=$true;CachePath=$dir.FullName;InstanceRoot=$Instance.Root;HostDatabase=$Instance.HostDatabase;StatusDatabase=$Instance.StatusDatabase})
+        }
+    }
+    foreach($item in @($items)){
+        $guidHistory=@($history|Where-Object{[string]$_.Guid -eq [string]$item.Guid});$repairs=@($guidHistory|Where-Object Type -eq 'RepairSuccess')
+        if($item.Status -in @('ЗАВИСАНИЕ','ОШИБКА')){
+            $startText=if($item.EpisodeStart){([datetime]$item.EpisodeStart).ToString('o')}elseif($item.LastEvent){([datetime]$item.LastEvent).ToString('o')}else{'unknown'}
+            $episodeKey="$($item.Guid)|$startText"
+            if(-not@($guidHistory|Where-Object{([string]$_.Type -eq 'FailureDetected') -and ([string]$_.EpisodeKey -eq $episodeKey)}).Count){
+                try{$record=Write-SynxIncidentHistory -InstanceRoot $Instance.Root -Type FailureDetected -Guid $item.Guid -Name $item.Name -ModelPath $item.ModelPath -Status $item.Status -HangCount $item.HangCount -ErrorCount $item.ErrorCount -EventTime $item.LastEvent -EpisodeKey $episodeKey -Message $item.LastMessage;$history+=,$record;$guidHistory+=,$record}catch{$historyStatus="ERROR: $($_.Exception.Message)"}
+            }
+        }
+        $failures=@($guidHistory|Where-Object Type -eq 'FailureDetected');$repeat=[bool](($item.Status -in @('ЗАВИСАНИЕ','ОШИБКА')) -and ($repairs.Count-gt0))
+        $item|Add-Member -NotePropertyName IncidentCount -NotePropertyValue $failures.Count
+        $item|Add-Member -NotePropertyName RepairCount -NotePropertyValue $repairs.Count
+        $item|Add-Member -NotePropertyName RepeatFailure -NotePropertyValue $repeat
+        $item|Add-Member -NotePropertyName RepeatText -NotePropertyValue $(if($repeat){'ПОВТОР'}else{''})
+    }
+    [pscustomobject]@{Instance=$Instance;Models=@($items|Sort-Object @{Expression={if($_.RepeatFailure){0}elseif($_.Status-eq'ЗАВИСАНИЕ'){1}elseif($_.Status-eq'ОШИБКА'){2}else{3}}},Name,Guid);Events=$events;DatabaseIntegrity=$dbIntegrity;StatusDatabaseIntegrity=$statusIntegrity;CacheStatus=$cacheStatus;ResolvedNames=$locations.Count;HistoryPath=$historyPath;HistoryStatus=$historyStatus}
 }
 
 function Test-SynxAdministrator {
     try{$id=[Security.Principal.WindowsIdentity]::GetCurrent();$p=New-Object Security.Principal.WindowsPrincipal($id);[bool]$p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)}catch{$false}
 }
 
+function ConvertTo-SynxAppPoolState {
+    param([Parameter(Mandatory)]$State)
+    foreach($name in @('Value','State','Status','CurrentState')){$property=$State.PSObject.Properties[$name];if(($null-ne$property) -and $property.Value){return [string]$property.Value}}
+    $text=[string]$State
+    if($text-match'(?i)started|stopped'){return $matches[0]}
+    $text
+}
+
+function Get-SynxWebAppPoolState {
+    param([Parameter(Mandatory)][string]$Name)
+    $state=Get-WebAppPoolState -Name $Name
+    if($null-eq$state){throw "IIS-пул $Name не вернул состояние."}
+    ConvertTo-SynxAppPoolState $state
+}
+
 function Get-AcceleratorRepairTargets {
     param([Parameter(Mandatory)]$Model)
     $year=[string]$Model.Year;$services=@()
     try{$all=@(Get-CimInstance Win32_Service|Where-Object{$_.Name-match'(?i)Auto.?Sync'-or$_.DisplayName-match'(?i)Revit.*Auto.?Sync'-or$_.PathName-match'(?i)Auto.?Sync'});$services=@($all|Where-Object{([string]$_.PathName-match[regex]::Escape([string]$Model.InstanceRoot))-or([string]$_.Name-match$year)-or([string]$_.DisplayName-match$year)})}catch{}
-    $pools=@();try{Import-Module WebAdministration -ErrorAction Stop;$pools=@(Get-ChildItem IIS:\AppPools|Where-Object{$_.Name-match"(?i)RevitServerAppPool.*$year|ModelService.*$year"}|ForEach-Object{[pscustomobject]@{Name=$_.Name;State=[string](Get-WebAppPoolState $_.Name).Value}})}catch{}
+    $pools=@();try{Import-Module WebAdministration -ErrorAction Stop;$pools=@(Get-ChildItem IIS:\AppPools|Where-Object{$_.Name-match"(?i)RevitServerAppPool.*$year|ModelService.*$year"}|ForEach-Object{[pscustomobject]@{Name=$_.Name;State=Get-SynxWebAppPoolState $_.Name}})}catch{}
     [pscustomobject]@{Services=@($services);Pools=@($pools)}
 }
 
@@ -173,15 +264,27 @@ function New-AcceleratorRepairPreview {
     [pscustomobject]@{Name=$Model.Name;ModelPath=$Model.ModelPath;Guid=$Model.Guid;HostNode=$Model.HostNode;Services=@($targets.Services|ForEach-Object{"$($_.DisplayName) [$($_.State)]"});Pools=@($targets.Pools|ForEach-Object{"$($_.Name) [$($_.State)]"})}
 }
 
+function Stop-SynxLingeringPoolWorkers {
+    param([Parameter(Mandatory)]$Targets)
+    $poolNames=@($Targets.Pools|ForEach-Object{[string]$_.Name}|Where-Object{$_})
+    if($poolNames.Count-eq0){return}
+    foreach($process in @(Get-CimInstance Win32_Process -Filter "Name='w3wp.exe'" -ErrorAction SilentlyContinue)){
+        $commandLine=[string]$process.CommandLine;$belongs=$false
+        foreach($poolName in $poolNames){if($commandLine-match[regex]::Escape($poolName)){$belongs=$true;break}}
+        if($belongs){Stop-Process -Id ([int]$process.ProcessId) -Force -ErrorAction SilentlyContinue}
+    }
+}
+
 function Wait-SynxServiceState([string]$Name,[string]$Status){for($i=0;$i-lt45;$i++){if([string](Get-Service $Name).Status-eq$Status){return};Start-Sleep 1};throw "Служба $Name не перешла в состояние $Status."}
 function Set-SynxRuntimeState {
     param($Targets,[ValidateSet('Stop','Start')]$Action)
     if($Targets.Pools.Count){Import-Module WebAdministration -ErrorAction Stop}
     if($Action-eq'Stop'){
         foreach($s in @($Targets.Services)){if(([string]$s.State-eq'Running') -and ([string](Get-Service $s.Name).Status-ne'Stopped')){Stop-Service $s.Name -Force -ErrorAction Stop;Wait-SynxServiceState $s.Name 'Stopped'}}
-        foreach($p in @($Targets.Pools)){if($p.State-eq'Started'){$current=[string](Get-WebAppPoolState $p.Name).Value;if($current-ne'Stopped'){Stop-WebAppPool $p.Name;for($i=0;$i-lt45;$i++){if((Get-WebAppPoolState $p.Name).Value-eq'Stopped'){break};Start-Sleep 1};if((Get-WebAppPoolState $p.Name).Value-ne'Stopped'){throw "IIS-пул $($p.Name) не остановился."}}}}
+        foreach($p in @($Targets.Pools)){$current=Get-SynxWebAppPoolState $p.Name;if($current-ne'Stopped'){Stop-WebAppPool $p.Name;for($i=0;$i-lt45;$i++){if((Get-SynxWebAppPoolState $p.Name)-eq'Stopped'){break};Start-Sleep 1};if((Get-SynxWebAppPoolState $p.Name)-ne'Stopped'){throw "IIS-пул $($p.Name) не остановился."}}}
+        Stop-SynxLingeringPoolWorkers $Targets
     }else{
-        foreach($p in @($Targets.Pools)){if((Get-WebAppPoolState $p.Name).Value-ne'Started'){Start-WebAppPool $p.Name;for($i=0;$i-lt45;$i++){if((Get-WebAppPoolState $p.Name).Value-eq'Started'){break};Start-Sleep 1};if((Get-WebAppPoolState $p.Name).Value-ne'Started'){throw "IIS-пул $($p.Name) не запустился."}}}
+        foreach($p in @($Targets.Pools)){if((Get-SynxWebAppPoolState $p.Name)-ne'Started'){Start-WebAppPool $p.Name;for($i=0;$i-lt45;$i++){if((Get-SynxWebAppPoolState $p.Name)-eq'Started'){break};Start-Sleep 1};if((Get-SynxWebAppPoolState $p.Name)-ne'Started'){throw "IIS-пул $($p.Name) не запустился."}}}
         foreach($s in @($Targets.Services)){if((Get-Service $s.Name).Status-ne'Running'){Start-Service $s.Name;Wait-SynxServiceState $s.Name 'Running'}}
     }
 }
@@ -192,7 +295,8 @@ function Set-SynxCacheRepairAccess {
     $takeown=Join-Path $env:SystemRoot 'System32\takeown.exe';$icacls=Join-Path $env:SystemRoot 'System32\icacls.exe'
     & $takeown '/F' $Path '/A' '/R' '/D' 'Y'|Out-Null
     if($LASTEXITCODE-ne0){throw "takeown не смог получить доступ к кэшу (Code $LASTEXITCODE)."}
-    & $icacls $Path '/grant' '*S-1-5-32-544:(OI)(CI)F' '/T' '/C' '/Q'|Out-Null
+    & $icacls $Path '/reset' '/T' '/C' '/Q'|Out-Null
+    & $icacls $Path '/inheritance:e' '/grant:r' '*S-1-5-32-544:(OI)(CI)F' '/T' '/C' '/Q'|Out-Null
     if($LASTEXITCODE-ne0){throw "icacls не смог выдать права на кэш (Code $LASTEXITCODE)."}
 }
 
@@ -288,8 +392,10 @@ function Invoke-AcceleratorModelRepair {
             "if(Test-Path -LiteralPath '$($quarantine.Replace("'","''"))'){[IO.Directory]::Move('$($quarantine.Replace("'","''"))','$(([string]$Model.CachePath).Replace("'","''"))')}"
         )|Set-Content (Join-Path $root Rollback.ps1) -Encoding UTF8
 
+        $historySaved=$true
+        try{[void](Write-SynxIncidentHistory -InstanceRoot $Model.InstanceRoot -Type RepairSuccess -Guid $guid -Name $Model.Name -ModelPath $Model.ModelPath -Status 'REPAIRED' -ActionRoot $root -Message 'Активный кэш GUID и локальная привязка удалены.')}catch{$historySaved=$false}
         Publish-RepairProgress 100 'Готово: локальные данные модели очищены'
-        [pscustomobject]@{Status='Changed';Name=$Model.Name;Guid=$guid;Message='Активный кэш GUID и локальная привязка удалены; база проверена; компоненты запущены.';ActionRoot=$root;Quarantine=$quarantine}
+        [pscustomobject]@{Status='Changed';Name=$Model.Name;Guid=$guid;Message='Активный кэш GUID и локальная привязка удалены; база проверена; компоненты запущены.';ActionRoot=$root;Quarantine=$quarantine;HistoryPath=(Get-SynxHistoryPath $Model.InstanceRoot);HistorySaved=$historySaved}
     }catch{
         $errorText=$_.Exception.Message
         try{
@@ -301,8 +407,9 @@ function Invoke-AcceleratorModelRepair {
             Publish-RepairProgress 100 'Откат завершён'
         }catch{$errorText+="; откат: $($_.Exception.Message)"}
         $manifest.Result='Failed';$manifest.Error=$errorText;$manifest|ConvertTo-Json -Depth 6|Set-Content (Join-Path $root manifest-error.json) -Encoding UTF8
+        try{[void](Write-SynxIncidentHistory -InstanceRoot $Model.InstanceRoot -Type RepairFailed -Guid $guid -Name $Model.Name -ModelPath $Model.ModelPath -Status 'FAILED' -ActionRoot $root -Message $errorText)}catch{}
         throw $errorText
     }
 }
 
-Export-ModuleMember -Function Initialize-SynxSqlite,Invoke-SynxSqliteQuery,Invoke-SynxSqliteExecute,Get-SynxSqliteIntegrity,ConvertFrom-AutoSyncLogLine,Get-AutoSyncLogAnalysis,Find-AutoSyncLogs,Get-RevitAcceleratorInstances,ConvertFrom-SynxGuidHex,Get-SynxModelLocationMap,Get-SynxModelEventState,Get-AcceleratorInventory,Test-SynxAdministrator,Get-AcceleratorRepairTargets,New-AcceleratorRepairPreview,Set-SynxCacheRepairAccess,Move-SynxCacheDirectory,Invoke-AcceleratorModelRepair
+Export-ModuleMember -Function Initialize-SynxSqlite,Invoke-SynxSqliteQuery,Invoke-SynxSqliteExecute,Get-SynxSqliteIntegrity,ConvertFrom-AutoSyncLogLine,Get-AutoSyncLogAnalysis,Find-AutoSyncLogs,Get-RevitAcceleratorInstances,ConvertFrom-SynxGuidHex,Get-SynxModelLocationMap,Get-SynxHistoryPath,Read-SynxIncidentHistory,Write-SynxIncidentHistory,Get-SynxLatestRepairTime,Get-SynxModelEventState,Get-AcceleratorInventory,Test-SynxAdministrator,ConvertTo-SynxAppPoolState,Get-SynxWebAppPoolState,Get-AcceleratorRepairTargets,New-AcceleratorRepairPreview,Stop-SynxLingeringPoolWorkers,Set-SynxCacheRepairAccess,Move-SynxCacheDirectory,Invoke-AcceleratorModelRepair

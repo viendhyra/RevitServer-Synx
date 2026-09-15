@@ -3,7 +3,7 @@ $ErrorActionPreference='Stop'
 Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase
 Import-Module (Join-Path $PSScriptRoot 'src\Accelerator.psm1') -Force
 $xamlPath=Join-Path $PSScriptRoot 'ui\MainWindow.xaml';[xml]$xaml=[IO.File]::ReadAllText($xamlPath,[Text.Encoding]::UTF8);$reader=New-Object Xml.XmlNodeReader $xaml;$window=[Windows.Markup.XamlReader]::Load($reader)
-$names=@('AdminStatusText','InstanceCombo','RefreshButton','SummaryText','LoadNamesButton','OpenLogButton','ModelsGrid','ErrorsGrid','SelectedText','RepairButton','BatchRepairButton','OpenCacheButton','RepairStepText','RepairProgress','RepairDetails','StatusText');$c=@{}
+$names=@('AdminStatusText','InstanceCombo','RefreshButton','SummaryText','LoadNamesButton','OpenLogButton','OpenHistoryButton','ModelsGrid','ErrorsGrid','SelectedText','RepairButton','BatchRepairButton','OpenCacheButton','RepairStepText','RepairProgress','RepairDetails','StatusText');$c=@{}
 foreach($name in $names){$control=$window.FindName($name);if($null-eq$control){throw "Элемент интерфейса не найден: $name"};$c[$name]=$control}
 $isAdmin=Test-SynxAdministrator;$c.AdminStatusText.Text=if($isAdmin){'Администратор — ремонт доступен'}else{'Просмотр — для ремонта нужны права администратора'};$script:instances=@();$script:analysis=$null
 function Show-Error([string]$Message){[void][Windows.MessageBox]::Show($window,$Message,'RevitServer Synx',[Windows.MessageBoxButton]::OK,[Windows.MessageBoxImage]::Error)}
@@ -17,15 +17,18 @@ function Refresh-Analysis{
     foreach($model in $models){if($model.Status-eq'ЗАВИСАНИЕ'){$stuck++}elseif($model.Status-eq'ОШИБКА'){$bad++}}
     $c.ModelsGrid.ItemsSource=$models;$c.ErrorsGrid.ItemsSource=if($visibleEvents.Count){@($visibleEvents|Sort-Object Time -Descending)}else{@()}
     $c.BatchRepairButton.IsEnabled=[bool]($isAdmin -and ($stuck -gt 0))
-    $c.SummaryText.Text="Моделей: $($models.Count); зависших: $stuck; с ошибками: $bad; имён: $($script:analysis.ResolvedNames); Host DB: $($script:analysis.DatabaseIntegrity); Status DB: $($script:analysis.StatusDatabaseIntegrity); CacheStatus: $($script:analysis.CacheStatus)"
+    $c.OpenHistoryButton.IsEnabled=[bool](Test-Path -LiteralPath $script:analysis.HistoryPath -PathType Leaf)
+    $repeat=@($models|Where-Object RepeatFailure).Count
+    $c.SummaryText.Text="Моделей: $($models.Count); зависших: $stuck; повторных: $repeat; с ошибками: $bad; имён: $($script:analysis.ResolvedNames); Host DB: $($script:analysis.DatabaseIntegrity); Status DB: $($script:analysis.StatusDatabaseIntegrity); журнал: $($script:analysis.HistoryStatus)"
     $c.StatusText.Text='Проверка завершена. Зависшие модели подняты вверх списка.'
   }catch{$c.StatusText.Text='Ошибка проверки';Show-Error $_.Exception.Message}
 }
-$c.InstanceCombo.Add_SelectionChanged({$script:analysis=$null;$c.ModelsGrid.ItemsSource=$null;$c.ErrorsGrid.ItemsSource=$null;$c.RepairButton.IsEnabled=$false;$c.BatchRepairButton.IsEnabled=$false;$c.OpenCacheButton.IsEnabled=$false})
+$c.InstanceCombo.Add_SelectionChanged({$script:analysis=$null;$c.ModelsGrid.ItemsSource=$null;$c.ErrorsGrid.ItemsSource=$null;$c.RepairButton.IsEnabled=$false;$c.BatchRepairButton.IsEnabled=$false;$c.OpenCacheButton.IsEnabled=$false;$c.OpenHistoryButton.IsEnabled=$false})
 $c.RefreshButton.Add_Click({Refresh-Analysis})
-$c.ModelsGrid.Add_SelectionChanged({$m=$c.ModelsGrid.SelectedItem;if($null-eq$m){$c.SelectedText.Text='Выберите строку слева';$c.RepairButton.IsEnabled=$false;$c.OpenCacheButton.IsEnabled=$false;return};$c.SelectedText.Text="Имя: $($m.Name)`nПуть модели: $($m.ModelPath)`nGUID: $($m.Guid)`nHost: $($m.HostNode)`nСостояние: $($m.Status)`nЗависаний: $($m.HangCount)`nКаталог: $($m.CachePath)";$c.RepairButton.IsEnabled=[bool]$isAdmin;$c.OpenCacheButton.IsEnabled=[bool](Test-Path -LiteralPath $m.CachePath)})
+$c.ModelsGrid.Add_SelectionChanged({$m=$c.ModelsGrid.SelectedItem;if($null-eq$m){$c.SelectedText.Text='Выберите строку слева';$c.RepairButton.IsEnabled=$false;$c.OpenCacheButton.IsEnabled=$false;return};$repeatText=if($m.RepeatFailure){'ДА — GUID снова упал после ремонта'}else{'нет'};$c.SelectedText.Text="Имя: $($m.Name)`nПуть модели: $($m.ModelPath)`nGUID: $($m.Guid)`nHost: $($m.HostNode)`nСостояние: $($m.Status)`nПовтор после ремонта: $repeatText`nСлучаев: $($m.IncidentCount); ремонтов: $($m.RepairCount)`nЗависаний: $($m.HangCount)`nКаталог: $($m.CachePath)";$c.RepairButton.IsEnabled=[bool]$isAdmin;$c.OpenCacheButton.IsEnabled=[bool](Test-Path -LiteralPath $m.CachePath)})
 $c.LoadNamesButton.Add_Click({$instance=$c.InstanceCombo.SelectedItem;if($null-eq$instance){return};$dialog=New-Object Microsoft.Win32.OpenFileDialog;$dialog.Title='Выберите ModelLocationTable.db3 с Revit Server Host';$dialog.Filter='ModelLocationTable.db3|ModelLocationTable.db3|SQLite (*.db3)|*.db3';if($dialog.ShowDialog($window)){$instance.LocationDatabases=@(@($instance.LocationDatabases)+$dialog.FileName|Sort-Object -Unique);Refresh-Analysis}})
 $c.OpenLogButton.Add_Click({$instance=$c.InstanceCombo.SelectedItem;if($null-ne$instance-and@($instance.LogPaths).Count){Start-Process notepad.exe -ArgumentList ('"'+$instance.LogPaths[0]+'"')}})
+$c.OpenHistoryButton.Add_Click({if(($null-ne$script:analysis) -and (Test-Path -LiteralPath $script:analysis.HistoryPath -PathType Leaf)){Start-Process notepad.exe -ArgumentList ('"'+$script:analysis.HistoryPath+'"')}})
 $c.OpenCacheButton.Add_Click({$m=$c.ModelsGrid.SelectedItem;if($null-ne$m-and(Test-Path -LiteralPath $m.CachePath)){Start-Process explorer.exe -ArgumentList ('"'+$m.CachePath+'"')}})
 $c.BatchRepairButton.Add_Click({
   if($null -eq $script:analysis){return}

@@ -15,9 +15,29 @@ Describe 'GitHub bootstrap' {
 
     [xml]$xaml=[IO.File]::ReadAllText((Join-Path $PSScriptRoot '../ui/MainWindow.xaml'),[Text.Encoding]::UTF8)
     $xamlText=$xaml.OuterXml
-    foreach($name in @('ModelsGrid','ErrorsGrid','RepairButton','BatchRepairButton','RepairProgress','RepairDetails')){
+    Add-Type -AssemblyName PresentationFramework
+    $reader=New-Object Xml.XmlNodeReader $xaml
+    $view=[Windows.Markup.XamlReader]::Load($reader)
+    foreach($name in @('ModelsGrid','ErrorsGrid','RepairButton','BatchRepairButton','OpenHistoryButton','RepairProgress','RepairDetails')){
       $xamlText|Should -Match ('x:Name="'+[regex]::Escape($name)+'"')
+      $view.FindName($name)|Should -Not -BeNullOrEmpty
     }
+  }
+}
+Describe 'Persistent incident history' {
+  It 'stores failure and repair records beside database backups' {
+    $root=Join-Path $TestDrive 'Revit Server 2024';$guid='11111111-2222-4333-8444-555555555555'
+    [void](Write-SynxIncidentHistory -InstanceRoot $root -Type FailureDetected -Guid $guid -Name 'Model.rvt' -Status 'ЗАВИСАНИЕ' -HangCount 3 -EventTime (Get-Date) -EpisodeKey 'episode-1')
+    [void](Write-SynxIncidentHistory -InstanceRoot $root -Type RepairSuccess -Guid $guid -Name 'Model.rvt' -ActionRoot (Join-Path $root 'SynxBackup\Repair_test'))
+    $path=Get-SynxHistoryPath $root
+    $path|Should -Be (Join-Path $root 'SynxBackup\SynxIncidentHistory.jsonl')
+    Test-Path -LiteralPath $path|Should -BeTrue
+    $history=@(Read-SynxIncidentHistory $root);$history.Count|Should -Be 2
+    (Get-SynxLatestRepairTime -History $history -Guid $guid)|Should -Not -BeNullOrEmpty
+  }
+  It 'accepts both IIS state object formats' {
+    ConvertTo-SynxAppPoolState ([pscustomobject]@{Value='Started'})|Should -Be 'Started'
+    ConvertTo-SynxAppPoolState 'Stopped'|Should -Be 'Stopped'
   }
 }
 Describe 'Model name mapping' {
@@ -45,4 +65,5 @@ Describe 'AutoSync log parser' {
   It 'classifies host lookup failures' {$event=ConvertFrom-AutoSyncLogLine '2026-09-15 00:26:42,532 INFO MSG(Comment: Failed to get IP addresses for 203.0.113.10:36942: No such host is known)';$event.Type|Should -Be 'HostResolution';$event.Level|Should -Be 'WARN';$event.HostNode|Should -Be '203.0.113.10:36942'}
   It 'recognizes successful synchronization' {(ConvertFrom-AutoSyncLogLine '2026-09-15 00:26:43,208 INFO MSG(Comment: Data is up-to-date with central.)').Level|Should -Be 'OK'}
   It 'clears historical hangs after a later successful synchronization' {$events=@((ConvertFrom-AutoSyncLogLine '2026-09-15 00:01:00,000 INFO MSG(Comment: Loop 1 : 1 threads are still not done for Model: C:\Cache\11111111-2222-4333-8444-555555555555\Data)'),(ConvertFrom-AutoSyncLogLine '2026-09-15 00:02:00,000 INFO MSG(Comment: Data is up-to-date with central.)'));$state=Get-SynxModelEventState $events;$state.Hangs.Count|Should -Be 0}
+  It 'ignores failures older than the last successful repair' {$events=@((ConvertFrom-AutoSyncLogLine '2026-09-15 00:01:00,000 INFO MSG(Comment: Loop 1 : 1 threads are still not done for Model: C:\Cache\11111111-2222-4333-8444-555555555555\Data)'),(ConvertFrom-AutoSyncLogLine '2026-09-15 00:03:00,000 INFO MSG(Comment: Loop 2 : 1 threads are still not done for Model: C:\Cache\11111111-2222-4333-8444-555555555555\Data)'));$state=Get-SynxModelEventState $events -After ([datetime]'2026-09-15 00:02:00');$state.Hangs.Count|Should -Be 1;$state.Hangs[0].Loop|Should -Be 2}
 }
