@@ -1,4 +1,4 @@
-BeforeAll { Import-Module (Join-Path $PSScriptRoot '../src/Accelerator.psm1') -Force }
+﻿BeforeAll { Import-Module (Join-Path $PSScriptRoot '../src/Accelerator.psm1') -Force }
 Describe 'AutoSync log parser' {
   It 'extracts a stuck cache GUID and loop number' {$line='2026-09-15 00:06:37,750 INFO TID(6) LOGGER(ServerLogger) MSG(Comment: Loop 453 : 1 threads are still not done for Model: C:\ProgramData\Autodesk\Revit Server 2022\Cache\11111111-2222-4333-8444-555555555555\Data)';$event=ConvertFrom-AutoSyncLogLine $line;$event.Type|Should -Be 'StuckThread';$event.Guid|Should -Be '11111111-2222-4333-8444-555555555555';$event.Loop|Should -Be 453}
   It 'classifies host lookup failures' {$event=ConvertFrom-AutoSyncLogLine '2026-09-15 00:26:42,532 INFO MSG(Comment: Failed to get IP addresses for 203.0.113.10:36942: No such host is known)';$event.Type|Should -Be 'HostResolution';$event.Level|Should -Be 'WARN';$event.HostNode|Should -Be '203.0.113.10:36942'}

@@ -1,4 +1,4 @@
-$ErrorActionPreference='Stop'
+﻿$ErrorActionPreference='Stop'
 [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
 $base='https://raw.githubusercontent.com/viendhyra/RevitServer-Synx/main'
 $target=Join-Path $env:TEMP ('RevitServer-Synx_'+(Get-Date -Format 'yyyyMMdd_HHmmss'))

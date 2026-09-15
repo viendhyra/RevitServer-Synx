@@ -1,4 +1,4 @@
-Set-StrictMode -Version 2.0
+﻿Set-StrictMode -Version 2.0
 
 function Initialize-SynxSqlite {
     if ('RevitServerSynx.NativeSqlite' -as [type]) { return }
