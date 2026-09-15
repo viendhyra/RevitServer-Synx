@@ -75,6 +75,11 @@ Describe 'Cache file inspection' {
     $cache=Join-Path $TestDrive 'Cache\11111111-2222-4333-8444-555555555555';$reports=Join-Path $TestDrive 'reports';New-Item -ItemType Directory -Path $cache -Force|Out-Null;[IO.File]::WriteAllBytes((Join-Path $cache 'empty.bin'),[byte[]]@())
     $result=Test-SynxCacheFiles -CachePath $cache -ReportDirectory $reports;$result.FileCount|Should -Be 1;$result.IssueCount|Should -Be 1;Test-Path -LiteralPath $result.ReportPath|Should -BeTrue
   }
+  It 'captures surrounding AutoSync log lines only for the requested GUID' {
+    $guid='11111111-2222-4333-8444-555555555555';$other='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';$log=Join-Path $TestDrive 'AutoSyncLog.log'
+    @('before','Model: C:\Cache\'+$guid+'\Data','after','Model: C:\Cache\'+$other+'\Data')|Set-Content -LiteralPath $log -Encoding UTF8
+    $context=@(Get-SynxGuidLogContext -Guid $guid -Paths @($log) -Before 1 -After 1);$context.Count|Should -Be 3;($context.Text-join' ')|Should -Match ([regex]::Escape($guid));($context.Text-join' ')|Should -Not -Match ([regex]::Escape($other))
+  }
 }
 Describe 'AutoSync log parser' {
   It 'handles models with no log events' {$state=Get-SynxModelEventState -Events @();$state.Hangs.Count|Should -Be 0;$state.Errors.Count|Should -Be 0;$state.Last.Count|Should -Be 0}

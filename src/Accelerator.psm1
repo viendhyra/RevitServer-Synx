@@ -168,20 +168,56 @@ function Import-SynxHostModelNames {
 function Test-SynxCacheFiles {
     param([Parameter(Mandatory)][string]$CachePath,[string]$ReportDirectory)
     if(-not(Test-Path -LiteralPath $CachePath -PathType Container)){throw "Каталог кэша не найден: $CachePath"}
-    $issues=New-Object Collections.ArrayList;$count=0;$bytes=[int64]0
-    foreach($file in @(Get-ChildItem -LiteralPath $CachePath -File -Recurse -Force -ErrorAction SilentlyContinue)){
+    $issues=New-Object Collections.ArrayList;$databaseChecks=New-Object Collections.ArrayList;$count=0;$bytes=[int64]0;$enumerationErrors=@()
+    $allFiles=@(Get-ChildItem -LiteralPath $CachePath -File -Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable enumerationErrors)
+    foreach($errorRecord in @($enumerationErrors)){[void]$issues.Add([pscustomobject]@{Type='EnumerationError';Path=$CachePath;Length=0;LastWriteTime=$null;Details=$errorRecord.Exception.Message})}
+    foreach($file in $allFiles){
         $count++;$bytes+=[int64]$file.Length;$kind='';$details=''
         if($file.Length-eq0){$kind='ZeroLength';$details='Файл нулевой длины'}
         try{$stream=New-Object IO.FileStream($file.FullName,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete);try{if($file.Length-gt0){[void]$stream.ReadByte()}}finally{$stream.Dispose()}}catch{$kind='Unreadable';$details=$_.Exception.Message}
         if($kind){[void]$issues.Add([pscustomobject]@{Type=$kind;Path=$file.FullName;Length=$file.Length;LastWriteTime=$file.LastWriteTime;Details=$details})}
     }
+    foreach($db in @($allFiles|Where-Object{$_.Extension-eq'.db3'})){
+        $integrity=Get-SynxSqliteIntegrity $db.FullName;[void]$databaseChecks.Add([pscustomobject]@{Path=$db.FullName;Integrity=$integrity;Length=$db.Length;LastWriteTime=$db.LastWriteTime})
+        if($integrity-ne'ok'){[void]$issues.Add([pscustomobject]@{Type='DatabaseIntegrity';Path=$db.FullName;Length=$db.Length;LastWriteTime=$db.LastWriteTime;Details=$integrity})}
+    }
+    $newest=@($allFiles|Sort-Object LastWriteTime -Descending|Select-Object -First 20|ForEach-Object{[pscustomobject]@{Path=$_.FullName;Length=$_.Length;LastWriteTime=$_.LastWriteTime;Extension=$_.Extension}})
+    $sidecars=@($allFiles|Where-Object{$_.Name-match'(?i)(-journal|-wal|-shm)$'}|ForEach-Object{$_.FullName})
+    $lastWrite=if($newest.Count){$newest[0].LastWriteTime}else{$null};$idleMinutes=if($lastWrite){[Math]::Round(((Get-Date)-[datetime]$lastWrite).TotalMinutes,1)}else{$null}
     $report=''
     if($ReportDirectory){
         if(-not(Test-Path -LiteralPath $ReportDirectory)){New-Item -ItemType Directory -Path $ReportDirectory -Force|Out-Null}
         $report=Join-Path $ReportDirectory ('CacheInspection_'+(Split-Path $CachePath -Leaf)+'_'+(Get-Date -Format yyyy-MM-dd_HHmmss)+'.json')
-        [ordered]@{Created=(Get-Date).ToString('o');CachePath=$CachePath;FileCount=$count;TotalBytes=$bytes;IssueCount=$issues.Count;Issues=@($issues)}|ConvertTo-Json -Depth 6|Set-Content -LiteralPath $report -Encoding UTF8
+        [ordered]@{Created=(Get-Date).ToString('o');CachePath=$CachePath;FileCount=$count;TotalBytes=$bytes;LastWriteTime=$lastWrite;IdleMinutes=$idleMinutes;IssueCount=$issues.Count;Issues=@($issues);DatabaseChecks=@($databaseChecks);TransactionSidecars=$sidecars;NewestFiles=$newest}|ConvertTo-Json -Depth 7|Set-Content -LiteralPath $report -Encoding UTF8
     }
-    [pscustomobject]@{CachePath=$CachePath;FileCount=$count;TotalBytes=$bytes;IssueCount=$issues.Count;Issues=@($issues);ReportPath=$report}
+    [pscustomobject]@{CachePath=$CachePath;FileCount=$count;TotalBytes=$bytes;LastWriteTime=$lastWrite;IdleMinutes=$idleMinutes;IssueCount=$issues.Count;Issues=@($issues);DatabaseChecks=@($databaseChecks);TransactionSidecars=$sidecars;NewestFiles=$newest;ReportPath=$report}
+}
+
+function Get-SynxGuidLogContext {
+    param([Parameter(Mandatory)][string]$Guid,[string[]]$Paths,[ValidateRange(100,200000)][int]$Tail=50000,[ValidateRange(0,20)][int]$Before=4,[ValidateRange(0,20)][int]$After=6)
+    $result=New-Object Collections.ArrayList;$needle=$Guid.ToLowerInvariant()
+    foreach($path in @($Paths)){
+        if((-not$path)-or(-not(Test-Path -LiteralPath $path -PathType Leaf))){continue}
+        $lines=@(Get-Content -LiteralPath $path -Tail $Tail -ErrorAction SilentlyContinue);$wanted=@{}
+        for($i=0;$i-lt$lines.Count;$i++){if(([string]$lines[$i]).ToLowerInvariant().Contains($needle)){for($j=[Math]::Max(0,$i-$Before);$j-le[Math]::Min($lines.Count-1,$i+$After);$j++){$wanted[$j]=$true}}}
+        foreach($index in @($wanted.Keys|Sort-Object)){[void]$result.Add([pscustomobject]@{LogPath=$path;TailLine=([int]$index+1);Text=[string]$lines[[int]$index]})}
+    }
+    @($result|Select-Object -Last 500)
+}
+
+function Test-SynxModelDiagnostics {
+    param([Parameter(Mandatory)]$Model,[string[]]$LogPaths,[Parameter(Mandatory)][string]$ReportDirectory)
+    $cache=Test-SynxCacheFiles -CachePath $Model.CachePath
+    $context=@(Get-SynxGuidLogContext -Guid ([string]$Model.Guid) -Paths $LogPaths)
+    if(-not(Test-Path -LiteralPath $ReportDirectory)){New-Item -ItemType Directory -Path $ReportDirectory -Force|Out-Null}
+    $report=Join-Path $ReportDirectory ("ModelDiagnostic_$($Model.Guid)_$(Get-Date -Format yyyy-MM-dd_HHmmss).json")
+    $recommendations=New-Object Collections.ArrayList
+    if(@($cache.DatabaseChecks|Where-Object{$_.Integrity-ne'ok'}).Count){[void]$recommendations.Add('Повреждена или заблокирована внутренняя SQLite-база кэша. Остановите AutoSync/IIS и повторите проверку; при сохранении ошибки выполните точечный ремонт.')}
+    if($cache.TransactionSidecars.Count){[void]$recommendations.Add('Найдены journal/WAL/SHM. При работающем AutoSync это может быть нормальной активной транзакцией; после остановки компонентов оставшийся файл указывает на незавершённую сессию.')}
+    if($Model.RepeatFailure){[void]$recommendations.Add('Тот же GUID повторно завис после очистки локального кэша. При исправном Host вероятен повторно загружаемый дефект центральной модели или сбой ModelService; создайте новую центральную модель через Revit/Save As после проверки отчёта.')}
+    if($cache.IssueCount-eq0-and$recommendations.Count-eq0){[void]$recommendations.Add('Явных файловых ошибок не найдено. Сопоставьте последний записанный файл со строками AutoSyncLog в LogContext.')}
+    [ordered]@{Created=(Get-Date).ToString('o');Guid=$Model.Guid;Name=$Model.Name;ModelPath=$Model.ModelPath;HostNode=$Model.HostNode;Status=$Model.Status;RepeatFailure=$Model.RepeatFailure;HangCount=$Model.HangCount;LastMessage=$Model.LastMessage;Cache=$cache;LogContext=$context;Recommendations=@($recommendations)}|ConvertTo-Json -Depth 9|Set-Content -LiteralPath $report -Encoding UTF8
+    [pscustomobject]@{Guid=$Model.Guid;Cache=$cache;LogContextCount=$context.Count;Recommendations=@($recommendations);ReportPath=$report}
 }
 
 function Get-SynxHistoryPath {
@@ -577,4 +613,4 @@ function Invoke-SynxHostAddressMigration {
     }
 }
 
-Export-ModuleMember -Function Initialize-SynxSqlite,Invoke-SynxSqliteQuery,Invoke-SynxSqliteExecute,Get-SynxSqliteIntegrity,ConvertFrom-AutoSyncLogLine,Get-AutoSyncLogAnalysis,Find-AutoSyncLogs,Get-RevitAcceleratorInstances,ConvertFrom-SynxGuidHex,Get-SynxModelLocationMap,Split-SynxHostNode,Get-SynxHostAddressSummary,Test-SynxHostEndpoint,Import-SynxHostModelNames,Test-SynxCacheFiles,Get-SynxHistoryPath,Read-SynxIncidentHistory,Write-SynxIncidentHistory,Get-SynxLatestRepairTime,Get-SynxModelEventState,Get-AcceleratorInventory,Test-SynxAdministrator,ConvertTo-SynxAppPoolState,Get-SynxWebAppPoolState,Get-AcceleratorRepairTargets,New-AcceleratorRepairPreview,Stop-SynxLingeringPoolWorkers,Set-SynxCacheRepairAccess,Move-SynxCacheDirectory,Invoke-AcceleratorModelRepair,Invoke-SynxHostAddressMigration
+Export-ModuleMember -Function Initialize-SynxSqlite,Invoke-SynxSqliteQuery,Invoke-SynxSqliteExecute,Get-SynxSqliteIntegrity,ConvertFrom-AutoSyncLogLine,Get-AutoSyncLogAnalysis,Find-AutoSyncLogs,Get-RevitAcceleratorInstances,ConvertFrom-SynxGuidHex,Get-SynxModelLocationMap,Split-SynxHostNode,Get-SynxHostAddressSummary,Test-SynxHostEndpoint,Import-SynxHostModelNames,Test-SynxCacheFiles,Get-SynxGuidLogContext,Test-SynxModelDiagnostics,Get-SynxHistoryPath,Read-SynxIncidentHistory,Write-SynxIncidentHistory,Get-SynxLatestRepairTime,Get-SynxModelEventState,Get-AcceleratorInventory,Test-SynxAdministrator,ConvertTo-SynxAppPoolState,Get-SynxWebAppPoolState,Get-AcceleratorRepairTargets,New-AcceleratorRepairPreview,Stop-SynxLingeringPoolWorkers,Set-SynxCacheRepairAccess,Move-SynxCacheDirectory,Invoke-AcceleratorModelRepair,Invoke-SynxHostAddressMigration
