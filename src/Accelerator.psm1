@@ -181,8 +181,8 @@ function Set-SynxRuntimeState {
         foreach($s in @($Targets.Services)){if(([string]$s.State-eq'Running') -and ([string](Get-Service $s.Name).Status-ne'Stopped')){Stop-Service $s.Name -Force -ErrorAction Stop;Wait-SynxServiceState $s.Name 'Stopped'}}
         foreach($p in @($Targets.Pools)){if($p.State-eq'Started'){$current=[string](Get-WebAppPoolState $p.Name).Value;if($current-ne'Stopped'){Stop-WebAppPool $p.Name;for($i=0;$i-lt45;$i++){if((Get-WebAppPoolState $p.Name).Value-eq'Stopped'){break};Start-Sleep 1};if((Get-WebAppPoolState $p.Name).Value-ne'Stopped'){throw "IIS-пул $($p.Name) не остановился."}}}}
     }else{
-        foreach($p in @($Targets.Pools)){if($p.State-eq'Started'-and(Get-WebAppPoolState $p.Name).Value-ne'Started'){Start-WebAppPool $p.Name;for($i=0;$i-lt45;$i++){if((Get-WebAppPoolState $p.Name).Value-eq'Started'){break};Start-Sleep 1};if((Get-WebAppPoolState $p.Name).Value-ne'Started'){throw "IIS-пул $($p.Name) не запустился."}}}
-        foreach($s in @($Targets.Services)){if([string]$s.State-eq'Running'-and(Get-Service $s.Name).Status-ne'Running'){Start-Service $s.Name;Wait-SynxServiceState $s.Name 'Running'}}
+        foreach($p in @($Targets.Pools)){if((Get-WebAppPoolState $p.Name).Value-ne'Started'){Start-WebAppPool $p.Name;for($i=0;$i-lt45;$i++){if((Get-WebAppPoolState $p.Name).Value-eq'Started'){break};Start-Sleep 1};if((Get-WebAppPoolState $p.Name).Value-ne'Started'){throw "IIS-пул $($p.Name) не запустился."}}}
+        foreach($s in @($Targets.Services)){if((Get-Service $s.Name).Status-ne'Running'){Start-Service $s.Name;Wait-SynxServiceState $s.Name 'Running'}}
     }
 }
 
