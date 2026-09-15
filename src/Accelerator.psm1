@@ -502,7 +502,7 @@ function Invoke-SynxHostAddressMigration {
     $affected=New-Object Collections.ArrayList
     foreach($row in @(Invoke-SynxSqliteQuery $Instance.HostDatabase 'SELECT lower(ModelIdentityGUID) AS Guid, HostNode FROM HostNodeForCachedModels ORDER BY ModelIdentityGUID;')){
         $node=Split-SynxHostNode ([string]$row.HostNode)
-        if($node.Address-eq$old){[void]$affected.Add([pscustomobject]@{Guid=([string]$row.Guid).ToLowerInvariant();OldHostNode=[string]$row.HostNode;Port=[string]$node.Port;NewHostNode=(Get-Endpoint $new ([string]$node.Port)})}
+        if($node.Address-eq$old){[void]$affected.Add([pscustomobject]@{Guid=([string]$row.Guid).ToLowerInvariant();OldHostNode=[string]$row.HostNode;Port=[string]$node.Port;NewHostNode=(Get-Endpoint $new ([string]$node.Port))})}
     }
     if($affected.Count-eq0){throw "В базе нет моделей с адресом $old."}
     if(-not$PSCmdlet.ShouldProcess("$($affected.Count) GUID: $old -> $new",'Миграция адреса Host и пересоздание затронутых кэшей')){return [pscustomobject]@{Status='Skipped';Message='Отменено'}}
@@ -555,9 +555,10 @@ function Invoke-SynxHostAddressMigration {
         Set-SynxRuntimeState $targets Start
         $manifest.Result='Changed';$manifest.Completed=Get-Date;$manifest.Quarantine=$qroot;$manifest|ConvertTo-Json -Depth 7|Set-Content (Join-Path $root 'manifest-after.json') -Encoding UTF8
         foreach($item in @($affected)){$model=if($nameMap.ContainsKey($item.Guid)){$nameMap[$item.Guid]}else{$null};try{[void](Write-SynxIncidentHistory -InstanceRoot $Instance.Root -Type HostAddressMigration -Guid $item.Guid -Name $(if($model){$model.Name}else{'—'}) -ModelPath $(if($model){$model.ModelPath}else{''}) -Status 'HOST_MIGRATED' -ActionRoot $root -Message "$($item.OldHostNode) -> $($item.NewHostNode); кэш отправлен в карантин.")}catch{}}
+        $backupHost=Join-Path $backup ([IO.Path]::GetFileName([string]$Instance.HostDatabase));$escapedBackup=$backupHost.Replace("'","''");$escapedActive=([string]$Instance.HostDatabase).Replace("'","''")
         @(
             "# Запустите от администратора. Сначала остановите AutoSync и IIS-пул Revit Server $($Instance.Year).",
-            "Copy-Item -LiteralPath '$((Join-Path $backup ([IO.Path]::GetFileName([string]$Instance.HostDatabase)).Replace("'","''"))' -Destination '$(([string]$Instance.HostDatabase).Replace("'","''"))' -Force"
+            "Copy-Item -LiteralPath '$escapedBackup' -Destination '$escapedActive' -Force"
         )|Set-Content (Join-Path $root 'Rollback.ps1') -Encoding UTF8
         Publish-MigrationProgress 100 "Готово: адрес исправлен для $($affected.Count) моделей"
         [pscustomobject]@{Status='Changed';OldAddress=$old;NewAddress=$new;AffectedCount=$affected.Count;AffectedModels=@($affected);ActionRoot=$root;BackupPath=$backup;Quarantine=$qroot;Message="Обновлено привязок: $($affected.Count). Кэши отправлены в карантин и будут загружены заново."}
