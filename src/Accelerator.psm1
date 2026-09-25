@@ -601,12 +601,53 @@ function Get-SynxPoolWorkerProcesses {
 }
 
 function Wait-SynxServiceState([string]$Name,[string]$Status){for($i=0;$i-lt45;$i++){if([string](Get-Service $Name).Status-eq$Status){return};Start-Sleep 1};throw "Служба $Name не перешла в состояние $Status."}
+function New-SynxStepReporter {
+    # Отчёт о долгом ожидании внутри шага: процент шага фиксирован, меняется текст.
+    param([scriptblock]$Callback,[int]$Percent)
+    if(-not$Callback){return $null}
+    {param($Text)&$Callback $Percent $Text}.GetNewClosure()
+}
+
+function Get-SynxPoolShutdownLimit {
+    # processModel.shutdownTimeLimit: столько IIS ждёт запросы пула при остановке (по умолчанию 90 с).
+    param([Parameter(Mandatory)][string]$Name)
+    try{
+        $raw=Get-ItemProperty ("IIS:\AppPools\"+$Name) -Name processModel.shutdownTimeLimit -ErrorAction Stop
+        $value=if($raw-is[TimeSpan]){$raw}elseif($null-ne$raw.PSObject.Properties['Value']){[TimeSpan]$raw.Value}else{[TimeSpan]$raw}
+        [int][Math]::Min(600,[Math]::Max(0,$value.TotalSeconds))
+    }catch{90}
+}
+
+function Wait-SynxAppPoolStopped {
+    # Зависшая модель = зависшие запросы в w3wp: пул висит в Stopping весь
+    # shutdownTimeLimit. Ждём лимит; если пул всё ещё Stopping — завершаем
+    # w3wp только этого пула (IIS сделал бы то же по истечении лимита).
+    param([Parameter(Mandatory)][string]$Name,[scriptblock]$Report)
+    $state=Get-SynxWebAppPoolState $Name
+    if($state-eq'Stopped'){return}
+    if($state-ne'Stopping'){Stop-WebAppPool $Name}
+    $limit=Get-SynxPoolShutdownLimit $Name;$started=Get-Date;$killed=$false;$tick=0
+    while($true){
+        $state='';try{$state=Get-SynxWebAppPoolState $Name}catch{$state="ошибка чтения: $($_.Exception.Message)"}
+        if($state-eq'Stopped'){return}
+        $elapsed=[int]((Get-Date)-$started).TotalSeconds
+        if($elapsed-ge($limit+30)){throw "IIS-пул $Name не остановился за $elapsed с (состояние: $state; shutdownTimeLimit: $limit с)."}
+        if((-not$killed)-and($elapsed-ge($limit+5))-and($state-eq'Stopping')){
+            $pids=@(Get-SynxPoolWorkerProcesses -PoolNames @($Name)|ForEach-Object{[int]$_.ProcessId})
+            foreach($id in $pids){Stop-Process -Id $id -Force -ErrorAction SilentlyContinue}
+            $killed=$true;if($Report){&$Report "IIS-пул $Name не завершил запросы за $limit с — завершены его w3wp.exe: $(if($pids.Count){$pids-join', '}else{'не найдены'})"}
+        }
+        if($Report-and($tick%5-eq0)){&$Report "Ожидание остановки IIS-пула ${Name}: $elapsed с (лимит IIS на завершение запросов — $limit с; состояние: $state)"}
+        $tick++;Start-Sleep -Seconds 1
+    }
+}
+
 function Set-SynxRuntimeState {
-    param($Targets,[ValidateSet('Stop','Start')]$Action)
+    param($Targets,[ValidateSet('Stop','Start')]$Action,[scriptblock]$Report)
     if($Targets.Pools.Count){Import-Module WebAdministration -ErrorAction Stop}
     if($Action-eq'Stop'){
-        foreach($s in @($Targets.Services)){if(([string]$s.State-eq'Running') -and ([string](Get-Service $s.Name).Status-ne'Stopped')){Stop-Service $s.Name -Force -ErrorAction Stop;Wait-SynxServiceState $s.Name 'Stopped'}}
-        foreach($p in @($Targets.Pools)){$current=Get-SynxWebAppPoolState $p.Name;if($current-ne'Stopped'){Stop-WebAppPool $p.Name;for($i=0;$i-lt45;$i++){if((Get-SynxWebAppPoolState $p.Name)-eq'Stopped'){break};Start-Sleep 1};if((Get-SynxWebAppPoolState $p.Name)-ne'Stopped'){throw "IIS-пул $($p.Name) не остановился."}}}
+        foreach($s in @($Targets.Services)){if(([string]$s.State-eq'Running') -and ([string](Get-Service $s.Name).Status-ne'Stopped')){if($Report){&$Report "Остановка службы $($s.Name)"};Stop-Service $s.Name -Force -ErrorAction Stop;Wait-SynxServiceState $s.Name 'Stopped'}}
+        foreach($p in @($Targets.Pools)){Wait-SynxAppPoolStopped -Name $p.Name -Report $Report}
         Stop-SynxLingeringPoolWorkers $Targets
     }else{
         # Поднимаем ВСЁ и лишь потом сообщаем об ошибках: прежняя версия падала
@@ -694,7 +735,7 @@ function Invoke-AcceleratorModelRepair {
         $manifest|ConvertTo-Json -Depth 6|Set-Content (Join-Path $root manifest-before.json) -Encoding UTF8
 
         Publish-RepairProgress 20 'Остановка AutoSync и IIS-пула'
-        Set-SynxRuntimeState $targets Stop
+        Set-SynxRuntimeState $targets Stop -Report (New-SynxStepReporter $ProgressCallback 20)
 
         Publish-RepairProgress 35 'Создание бэкапа SQLite-баз'
         foreach($db in @($Model.HostDatabase,$Model.StatusDatabase)){
@@ -766,7 +807,7 @@ function Invoke-AcceleratorModelRepair {
         $errorText=$_.Exception.Message
         try{
             Publish-RepairProgress 80 'Ошибка: выполняется безопасный откат'
-            Set-SynxRuntimeState $targets Stop
+            Set-SynxRuntimeState $targets Stop -Report (New-SynxStepReporter $ProgressCallback 80)
             if($changed){[void](Restore-SynxDatabaseSet -BackupDir $backup -Databases @($Model.HostDatabase))}
             if($moved-and(Test-Path $quarantine)-and-not(Test-Path $Model.CachePath)){[IO.Directory]::Move([string]$quarantine,[string]$Model.CachePath)}
             Set-SynxRuntimeState $targets Start
@@ -822,7 +863,7 @@ function Invoke-SynxHostAddressMigration {
         Publish-MigrationProgress 8 'Сохранение плана миграции'
         $manifest|ConvertTo-Json -Depth 7|Set-Content (Join-Path $root 'manifest-before.json') -Encoding UTF8
         Publish-MigrationProgress 15 'Остановка AutoSync и IIS-пула'
-        Set-SynxRuntimeState $targets Stop
+        Set-SynxRuntimeState $targets Stop -Report (New-SynxStepReporter $ProgressCallback 15)
 
         Publish-MigrationProgress 28 'Создание и проверка бэкапа SQLite-баз'
         foreach($db in @($Instance.HostDatabase,$Instance.StatusDatabase)){
@@ -866,7 +907,7 @@ function Invoke-SynxHostAddressMigration {
         $errorText=$_.Exception.Message
         try{
             Publish-MigrationProgress 82 'Ошибка: восстановление баз и кэшей'
-            Set-SynxRuntimeState $targets Stop
+            Set-SynxRuntimeState $targets Stop -Report (New-SynxStepReporter $ProgressCallback 82)
             if($databaseChanged){foreach($db in @($Instance.HostDatabase,$Instance.StatusDatabase)){if(-not$db){continue};foreach($suffix in @('','-journal','-wal','-shm')){$active=$db+$suffix;$copy=Join-Path $backup ([IO.Path]::GetFileName($active));if(Test-Path -LiteralPath $copy -PathType Leaf){Copy-Item -LiteralPath $copy -Destination $active -Force}}}}
             foreach($item in @($moved|Sort-Object Guid -Descending)){if((Test-Path -LiteralPath $item.Destination -PathType Container)-and(-not(Test-Path -LiteralPath $item.Source))){[IO.Directory]::Move([string]$item.Destination,[string]$item.Source)}}
             Set-SynxRuntimeState $targets Start;Publish-MigrationProgress 100 'Откат завершён'
@@ -917,7 +958,7 @@ function Invoke-SynxFullCacheClear {
         $manifest|ConvertTo-Json -Depth 6|Set-Content (Join-Path $root 'manifest-before.json') -Encoding UTF8
 
         Publish-ClearProgress 15 'Остановка AutoSync и IIS-пула'
-        Set-SynxRuntimeState $targets Stop
+        Set-SynxRuntimeState $targets Stop -Report (New-SynxStepReporter $ProgressCallback 15)
 
         # Список заново: за время остановки службы могли дописать или убрать файлы.
         $items=@(Get-ChildItem -LiteralPath $cache -Force -ErrorAction Stop)
@@ -976,7 +1017,7 @@ function Invoke-SynxFullCacheClear {
         $errorText=$_.Exception.Message
         try{
             Publish-ClearProgress 85 'Ошибка: возврат кэша из карантина'
-            Set-SynxRuntimeState $targets Stop
+            Set-SynxRuntimeState $targets Stop -Report (New-SynxStepReporter $ProgressCallback 85)
             for($i=$moved.Count-1;$i-ge0;$i--){$m=$moved[$i];if((Test-Path -LiteralPath $m.Destination)-and(-not(Test-Path -LiteralPath $m.Source))){[IO.Directory]::Move([string]$m.Destination,[string]$m.Source)}}
             Set-SynxRuntimeState $targets Start
             Publish-ClearProgress 100 'Откат завершён'
@@ -986,4 +1027,4 @@ function Invoke-SynxFullCacheClear {
     }
 }
 
-Export-ModuleMember -Function Invoke-SynxFullCacheClear,Get-SynxModelStatus,Restore-SynxDatabaseSet,Get-SynxAppPoolInventory,Select-SynxRepairPools,Get-SynxPoolNameFromCommandLine,Get-SynxPoolWorkerProcesses,Initialize-SynxSqlite,Invoke-SynxSqliteQuery,Invoke-SynxSqliteExecute,Get-SynxSqliteIntegrity,ConvertFrom-AutoSyncLogLine,Get-AutoSyncLogAnalysis,Find-AutoSyncLogs,Get-RevitAcceleratorInstances,ConvertFrom-SynxGuidHex,Get-SynxModelLocationMap,Split-SynxHostNode,Get-SynxHostAddressSummary,Test-SynxHostEndpoint,Import-SynxHostModelNames,Test-SynxCacheFiles,Get-SynxGuidLogContext,Test-SynxModelDiagnostics,Get-SynxHistoryPath,Read-SynxIncidentHistory,Write-SynxIncidentHistory,Get-SynxLatestRepairTime,Get-SynxModelEventState,Get-AcceleratorInventory,Test-SynxAdministrator,ConvertTo-SynxAppPoolState,Get-SynxWebAppPoolState,Get-AcceleratorRepairTargets,New-AcceleratorRepairPreview,Stop-SynxLingeringPoolWorkers,Set-SynxCacheRepairAccess,Move-SynxCacheDirectory,Invoke-AcceleratorModelRepair,Invoke-SynxHostAddressMigration
+Export-ModuleMember -Function Invoke-SynxFullCacheClear,Wait-SynxAppPoolStopped,Get-SynxPoolShutdownLimit,New-SynxStepReporter,Get-SynxModelStatus,Restore-SynxDatabaseSet,Get-SynxAppPoolInventory,Select-SynxRepairPools,Get-SynxPoolNameFromCommandLine,Get-SynxPoolWorkerProcesses,Initialize-SynxSqlite,Invoke-SynxSqliteQuery,Invoke-SynxSqliteExecute,Get-SynxSqliteIntegrity,ConvertFrom-AutoSyncLogLine,Get-AutoSyncLogAnalysis,Find-AutoSyncLogs,Get-RevitAcceleratorInstances,ConvertFrom-SynxGuidHex,Get-SynxModelLocationMap,Split-SynxHostNode,Get-SynxHostAddressSummary,Test-SynxHostEndpoint,Import-SynxHostModelNames,Test-SynxCacheFiles,Get-SynxGuidLogContext,Test-SynxModelDiagnostics,Get-SynxHistoryPath,Read-SynxIncidentHistory,Write-SynxIncidentHistory,Get-SynxLatestRepairTime,Get-SynxModelEventState,Get-AcceleratorInventory,Test-SynxAdministrator,ConvertTo-SynxAppPoolState,Get-SynxWebAppPoolState,Get-AcceleratorRepairTargets,New-AcceleratorRepairPreview,Stop-SynxLingeringPoolWorkers,Set-SynxCacheRepairAccess,Move-SynxCacheDirectory,Invoke-AcceleratorModelRepair,Invoke-SynxHostAddressMigration
