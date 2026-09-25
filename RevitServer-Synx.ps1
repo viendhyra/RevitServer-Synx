@@ -4,10 +4,10 @@ Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase
 $modulePath=Join-Path $PSScriptRoot 'src\Accelerator.psm1'
 Import-Module $modulePath -Force
 $xamlPath=Join-Path $PSScriptRoot 'ui\MainWindow.xaml';[xml]$xaml=[IO.File]::ReadAllText($xamlPath,[Text.Encoding]::UTF8);$reader=New-Object Xml.XmlNodeReader $xaml;$window=[Windows.Markup.XamlReader]::Load($reader)
-$names=@('AdminStatusText','InstanceCombo','RefreshButton','SummaryText','LoadNamesButton','OpenLogButton','OpenHistoryButton','ClearCacheButton','OldHostCombo','NewHostText','TestHostButton','MigrateHostButton','LoadHostNamesButton','HostStatusText','ModelsGrid','ErrorsGrid','SelectedText','DiagnosisCard','DiagnosisTitleText','DiagnosisConfidenceText','DiagnosisEvidenceText','DiagnosisActionText','RepairButton','BatchRepairButton','CacheCheckButton','OpenDiagnosticButton','OpenCacheButton','RepairStepText','RepairProgress','RepairDetails','StatusText','JobProgress');$c=@{}
+$names=@('AdminStatusText','InstanceCombo','RefreshButton','SummaryText','LoadNamesButton','OpenLogButton','OpenHistoryButton','ClearCacheButton','OldHostCombo','NewHostText','TestHostButton','MigrateHostButton','LoadHostNamesButton','HostStatusText','ModelsGrid','ErrorsGrid','SelectedText','DiagnosisCard','DiagnosisTitleText','DiagnosisConfidenceText','DiagnosisEvidenceText','DiagnosisActionText','RepairButton','BatchRepairButton','CacheCheckButton','OpenDiagnosticButton','OpenCacheButton','RepairStepText','RepairProgress','RepairDetails','StatusText','JobProgress','AdminBadge','ModelsTab','ErrorsTab','HostExpander');$c=@{}
 foreach($name in $names){$control=$window.FindName($name);if($null-eq$control){throw "Элемент интерфейса не найден: $name"};$c[$name]=$control}
 $script:job=$null;$script:batchLimit=5
-$isAdmin=Test-SynxAdministrator;$c.AdminStatusText.Text=if($isAdmin){'Администратор — ремонт доступен'}else{'Просмотр — для ремонта нужны права администратора'};$script:instances=@();$script:analysis=$null;$script:hostTest=$null;$script:lastDiagnosticPath=''
+$isAdmin=Test-SynxAdministrator;$c.AdminStatusText.Text=if($isAdmin){'Администратор — ремонт доступен'}else{'Только просмотр — для ремонта нужны права администратора'};if(-not$isAdmin){$c.AdminBadge.Background='#78350F';$c.AdminStatusText.Foreground='#FEF3C7'};$script:instances=@();$script:analysis=$null;$script:hostTest=$null;$script:lastDiagnosticPath=''
 function Show-Error([string]$Message){[void][Windows.MessageBox]::Show($window,$Message,'RevitServer Synx',[Windows.MessageBoxButton]::OK,[Windows.MessageBoxImage]::Error)}
 function Confirm-Action([string]$Message,[string]$Title){[Windows.MessageBox]::Show($window,$Message,$Title,[Windows.MessageBoxButton]::YesNo,[Windows.MessageBoxImage]::Warning)-eq[Windows.MessageBoxResult]::Yes}
 function Set-DiagnosisPanel($Model,[string]$Reason,[string]$Confidence,[string]$Evidence,[string]$Action){
@@ -85,11 +85,13 @@ function Show-Analysis($Result){
   $script:analysis=$Result.Analysis;$models=@($script:analysis.Models);$visibleEvents=@($Result.VisibleEvents);$stuck=0;$bad=0
   foreach($model in $models){if($model.Status-eq'ЗАВИСАНИЕ'){$stuck++}elseif($model.Status-eq'ОШИБКА'){$bad++}}
   $c.ModelsGrid.ItemsSource=$models;$c.ErrorsGrid.ItemsSource=$visibleEvents
+  $c.ModelsTab.Header="Модели · $($models.Count)";$c.ErrorsTab.Header="Ошибки AutoSync · $($visibleEvents.Count)"
   $repeat=@($models|Where-Object RepeatFailure).Count
   $oldSelection=if($null-ne$c.OldHostCombo.SelectedItem){[string]$c.OldHostCombo.SelectedItem.Address}else{''};$hostGroups=@($Result.Hosts);$c.OldHostCombo.ItemsSource=$hostGroups
   $preferred='';foreach($event in @($visibleEvents)){if($event.Type-eq'HostResolution'-and$event.HostNode){$preferred=(Split-SynxHostNode ([string]$event.HostNode)).Address;break}}
   for($i=0;$i-lt$hostGroups.Count;$i++){if(($preferred-and$hostGroups[$i].Address-eq$preferred)-or((-not$preferred)-and$oldSelection-and$hostGroups[$i].Address-eq$oldSelection)){$c.OldHostCombo.SelectedIndex=$i;break}}
   if(($c.OldHostCombo.SelectedIndex-lt0)-and$hostGroups.Count){$c.OldHostCombo.SelectedIndex=0}
+  if($preferred){$c.HostExpander.IsExpanded=$true}
   $c.HostStatusText.Text=if($hostGroups.Count){"Найдено адресов: $($hostGroups.Count). Выберите устаревший Host и введите новый."}else{'В Host DB нет адресов моделей.'};$script:hostTest=$null
   $c.SummaryText.Text="Моделей: $($models.Count); зависших: $stuck; повторных: $repeat; с ошибками: $bad; имён: $($script:analysis.ResolvedNames); Host DB: $($script:analysis.DatabaseIntegrity); Status DB: $($script:analysis.StatusDatabaseIntegrity); журнал: $($script:analysis.HistoryStatus)"
   $c.StatusText.Text='Проверка завершена. Зависшие модели подняты вверх списка.'
@@ -117,7 +119,7 @@ function Refresh-Analysis{
   }
 }
 
-$c.InstanceCombo.Add_SelectionChanged({$script:analysis=$null;$script:hostTest=$null;$script:lastDiagnosticPath='';$c.ModelsGrid.ItemsSource=$null;$c.ErrorsGrid.ItemsSource=$null;$c.OldHostCombo.ItemsSource=$null;Set-DiagnosisPanel $null '' '' '' '';Update-Buttons})
+$c.InstanceCombo.Add_SelectionChanged({$script:analysis=$null;$script:hostTest=$null;$script:lastDiagnosticPath='';$c.ModelsGrid.ItemsSource=$null;$c.ErrorsGrid.ItemsSource=$null;$c.OldHostCombo.ItemsSource=$null;$c.ModelsTab.Header='Модели';$c.ErrorsTab.Header='Ошибки AutoSync';Set-DiagnosisPanel $null '' '' '' '';Update-Buttons})
 $c.RefreshButton.Add_Click({Refresh-Analysis})
 $c.ModelsGrid.Add_SelectionChanged({$m=$c.ModelsGrid.SelectedItem;$script:lastDiagnosticPath='';Update-Buttons;if($null-eq$m){$c.SelectedText.Text='Выберите строку слева';Set-DiagnosisPanel $null '' '' '' '';return};$repeatText=if($m.RepeatFailure){'ДА — GUID снова упал после ремонта'}else{'нет'};$c.SelectedText.Text="Имя: $($m.Name)`nПуть модели: $($m.ModelPath)`nGUID: $($m.Guid)`nHost: $($m.HostNode)`nСостояние: $($m.Status)`nПовтор после ремонта: $repeatText`nСлучаев: $($m.IncidentCount); ремонтов: $($m.RepairCount)`nЗависаний: $($m.HangCount)`nКаталог: $($m.CachePath)";Set-DiagnosisPanel $m $m.Diagnosis $m.DiagnosisConfidence $m.DiagnosisEvidence $m.DiagnosisAction})
 $c.LoadNamesButton.Add_Click({$instance=$c.InstanceCombo.SelectedItem;if($null-eq$instance){return};$dialog=New-Object Microsoft.Win32.OpenFileDialog;$dialog.Title='Выберите ModelLocationTable.db3 с Revit Server Host';$dialog.Filter='ModelLocationTable.db3|ModelLocationTable.db3|SQLite (*.db3)|*.db3';if($dialog.ShowDialog($window)){$instance.LocationDatabases=@(@($instance.LocationDatabases)+$dialog.FileName|Sort-Object -Unique);Refresh-Analysis}})
