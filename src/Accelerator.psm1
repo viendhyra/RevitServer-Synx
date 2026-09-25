@@ -66,21 +66,38 @@ function ConvertFrom-AutoSyncLogLine {
 }
 
 function Get-AutoSyncLogAnalysis {
-    param([string[]]$Paths,[ValidateRange(100,200000)][int]$Tail=30000,[bool]$AssociateContext=$true)
+    param([string[]]$Paths,[ValidateRange(100,200000)][int]$Tail=30000,[bool]$AssociateContext=$true,[scriptblock]$ProgressCallback)
     $events=New-Object Collections.ArrayList
     $seen=@{}
-    foreach($path in @($Paths)){
-        if((-not $path) -or (-not (Test-Path -LiteralPath $path -PathType Leaf)) -or $seen.ContainsKey([string]$path)){continue}
-        $seen[[string]$path]=$true
-        $currentGuid=''
-        try{foreach($line in @(Get-Content -LiteralPath $path -Tail $Tail -ErrorAction Stop)){
-            $event=ConvertFrom-AutoSyncLogLine ([string]$line)
+    # Быстрый отсев: объект события строится только для строк, которые
+    # ConvertFrom-AutoSyncLogLine не отнесёт к Info. Раньше объект создавался
+    # на каждую строку — 8 с на файл, и окно висло.
+    $interesting=New-Object regex '(?i)threads?\s+are\s+still\s+not\s+done|Failed to|\bERROR\b|Exception|locked by another process|up-to-date with central','Compiled'
+    $guidPattern=New-Object regex '(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}','Compiled'
+    $files=@(@($Paths)|Where-Object{$_})
+    for($fileIndex=0;$fileIndex-lt$files.Count;$fileIndex++){
+        $path=[string]$files[$fileIndex]
+        if((-not (Test-Path -LiteralPath $path -PathType Leaf)) -or $seen.ContainsKey($path)){continue}
+        $seen[$path]=$true
+        $currentGuid='';$name=[IO.Path]::GetFileName($path)
+        if($ProgressCallback){&$ProgressCallback ([int]($fileIndex*100/$files.Count)) "Лог [$($fileIndex+1)/$($files.Count)] $name"}
+        try{
+            $lines=[string[]](Get-Content -LiteralPath $path -Tail $Tail -ReadCount 0 -ErrorAction Stop)
+            $lineCount=if($lines){$lines.Count}else{0};$lineIndex=0
+            foreach($line in $lines){
+            $lineIndex++
+            if($ProgressCallback-and($lineIndex%5000-eq0)){&$ProgressCallback ([int](($fileIndex+$lineIndex/$lineCount)*100/$files.Count)) "Лог [$($fileIndex+1)/$($files.Count)] $name — строк $lineIndex из $lineCount"}
+            if(-not$interesting.IsMatch($line)){
+                if($AssociateContext){$gm=$guidPattern.Match($line);if($gm.Success){$currentGuid=$gm.Value.ToLowerInvariant()}}
+                continue
+            }
+            $event=ConvertFrom-AutoSyncLogLine $line
             if($AssociateContext){
                 if($event.Guid){$currentGuid=$event.Guid}
                 elseif($currentGuid -and ($event.Type -in @('UpToDate','Error'))){$event.Guid=$currentGuid}
                 if($event.Type-eq'UpToDate'){$currentGuid=''}
             }
-            if($event.Type-ne'Info'){$event|Add-Member -NotePropertyName LogPath -NotePropertyValue $path;[void]$events.Add($event)}
+            if($event.Type-ne'Info'){$event.PSObject.Properties.Add((New-Object Management.Automation.PSNoteProperty 'LogPath',$path));[void]$events.Add($event)}
         }}catch{[void]$events.Add([pscustomobject]@{Time=Get-Date;Level='FAIL';Type='LogRead';Guid='';HostNode='';Loop=0;Threads=0;Message=$_.Exception.Message;Raw='';LogPath=$path})}
     };@($events)
 }
@@ -176,18 +193,21 @@ function Import-SynxHostModelNames {
 }
 
 function Test-SynxCacheFiles {
-    param([Parameter(Mandatory)][string]$CachePath,[string]$ReportDirectory)
+    param([Parameter(Mandatory)][string]$CachePath,[string]$ReportDirectory,[scriptblock]$ProgressCallback)
     if(-not(Test-Path -LiteralPath $CachePath -PathType Container)){throw "Каталог кэша не найден: $CachePath"}
+    if($ProgressCallback){&$ProgressCallback 0 "Составление списка файлов $CachePath"}
     $issues=New-Object Collections.ArrayList;$databaseChecks=New-Object Collections.ArrayList;$count=0;$bytes=[int64]0;$enumerationErrors=@()
     $allFiles=@(Get-ChildItem -LiteralPath $CachePath -File -Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable enumerationErrors)
     foreach($errorRecord in @($enumerationErrors)){[void]$issues.Add([pscustomobject]@{Type='EnumerationError';Path=$CachePath;Length=0;LastWriteTime=$null;Details=$errorRecord.Exception.Message})}
     foreach($file in $allFiles){
+        if($ProgressCallback-and($count%200-eq0)){&$ProgressCallback ([int]($count*80/[Math]::Max(1,$allFiles.Count))) "Чтение файлов кэша: $count из $($allFiles.Count)"}
         $count++;$bytes+=[int64]$file.Length;$kind='';$details=''
         if($file.Length-eq0){$kind='ZeroLength';$details='Файл нулевой длины'}
         try{$share=[IO.FileShare]([int][IO.FileShare]::ReadWrite -bor [int][IO.FileShare]::Delete);$stream=[IO.File]::Open($file.FullName,[IO.FileMode]::Open,[IO.FileAccess]::Read,$share);try{if($file.Length-gt0){[void]$stream.ReadByte()}}finally{$stream.Dispose()}}catch{$kind='Unreadable';$details=$_.Exception.Message}
         if($kind){[void]$issues.Add([pscustomobject]@{Type=$kind;Path=$file.FullName;Length=$file.Length;LastWriteTime=$file.LastWriteTime;Details=$details})}
     }
     foreach($db in @($allFiles|Where-Object{$_.Extension-eq'.db3'})){
+        if($ProgressCallback){&$ProgressCallback 85 "integrity_check: $($db.Name)"}
         $integrity=Get-SynxSqliteIntegrity $db.FullName;[void]$databaseChecks.Add([pscustomobject]@{Path=$db.FullName;Integrity=$integrity;Length=$db.Length;LastWriteTime=$db.LastWriteTime})
         if($integrity-ne'ok'){[void]$issues.Add([pscustomobject]@{Type='DatabaseIntegrity';Path=$db.FullName;Length=$db.Length;LastWriteTime=$db.LastWriteTime;Details=$integrity})}
     }
@@ -216,13 +236,19 @@ function Get-SynxGuidLogContext {
 }
 
 function Test-SynxModelDiagnostics {
-    param([Parameter(Mandatory)]$Model,[string[]]$LogPaths,[Parameter(Mandatory)][string]$ReportDirectory)
-    $cache=Test-SynxCacheFiles -CachePath $Model.CachePath
+    param([Parameter(Mandatory)]$Model,[string[]]$LogPaths,[Parameter(Mandatory)][string]$ReportDirectory,[scriptblock]$ProgressCallback)
+    function Publish-DiagnosticProgress([int]$Percent,[string]$Message){if($ProgressCallback){&$ProgressCallback $Percent $Message}}
+    $outer=$ProgressCallback;$fileProgress=$null
+    if($outer){$fileProgress={param($p,$t)&$outer ([int]($p*0.6)) $t}.GetNewClosure()}
+    $cache=Test-SynxCacheFiles -CachePath $Model.CachePath -ProgressCallback $fileProgress
+    Publish-DiagnosticProgress 62 'Поиск GUID в AutoSyncLog'
     $context=@(Get-SynxGuidLogContext -Guid ([string]$Model.Guid) -Paths $LogPaths)
     if(-not(Test-Path -LiteralPath $ReportDirectory)){New-Item -ItemType Directory -Path $ReportDirectory -Force|Out-Null}
     $report=Join-Path $ReportDirectory ("ModelDiagnostic_$($Model.Guid)_$(Get-Date -Format yyyy-MM-dd_HHmmss).json")
+    Publish-DiagnosticProgress 72 'Чтение ACL каталога'
     $aclInfo=$null
     try{$acl=Get-Acl -LiteralPath $Model.CachePath -ErrorAction Stop;$aclInfo=[pscustomobject]@{Owner=$acl.Owner;InheritanceProtected=$acl.AreAccessRulesProtected;Rules=@($acl.Access|ForEach-Object{[pscustomobject]@{Identity=[string]$_.IdentityReference;Type=[string]$_.AccessControlType;Rights=[string]$_.FileSystemRights;Inherited=$_.IsInherited}})}}catch{$aclInfo=[pscustomobject]@{Error=$_.Exception.Message}}
+    Publish-DiagnosticProgress 78 'Проверка доступности Host'
     $hostCheck=$null
     try{if([string]$Model.HostNode){$node=Split-SynxHostNode ([string]$Model.HostNode);if($node.Address-and$node.Port){$hostCheck=Test-SynxHostEndpoint -Address $node.Address -Ports @($node.Port)}}}catch{$hostCheck=[pscustomobject]@{Address=$Model.HostNode;Resolved=$false;AllPortsOpen=$false;ResolveError=$_.Exception.Message;Checks=@()}}
     $zeroStreamLines=@($context|Where-Object{$_.Text-match'(?i)<[^>]*StreamLength>\s*0\s*</'})
@@ -230,6 +256,7 @@ function Test-SynxModelDiagnostics {
     $badDatabases=@($cache.DatabaseChecks|Where-Object{$_.Integrity-ne'ok'})
     $unreadable=@($cache.Issues|Where-Object{$_.Type-in @('Unreadable','EnumerationError')})
     $lockReport=$null
+    if($unreadable.Count){Publish-DiagnosticProgress 86 'Поиск процессов, держащих файлы'}
     if($unreadable.Count){try{Import-Module (Join-Path $PSScriptRoot 'FileLocks.psm1') -Force -ErrorAction Stop;$lockReport=Get-SynxCacheLockReport -CachePath $Model.CachePath -ExpectedAppPool ("RevitServerAppPool$($Model.Year)")}catch{}}
     $zeroFiles=@($cache.Issues|Where-Object{$_.Type-eq'ZeroLength'})
     $aclRules=@();if(($null-ne$aclInfo)-and($null-ne$aclInfo.PSObject.Properties['Rules'])){$aclRules=@($aclInfo.Rules)};$serviceAclPattern='(?i)SYSTEM|IIS_IUSRS|IIS AppPool|NETWORK SERVICE'
@@ -262,6 +289,7 @@ function Test-SynxModelDiagnostics {
     if($zeroStreamLines.Count){[void]$evidence.Add("В контексте WCF есть StreamLength=0: $($zeroStreamLines.Count); само по себе это не доказывает передачу 0 байт")}
     if($cache.NewestFiles.Count){$newestText=if($cache.NewestFiles[0].LastWriteTime){([datetime]$cache.NewestFiles[0].LastWriteTime).ToString('dd.MM.yyyy HH:mm:ss')}else{'—'};[void]$evidence.Add("Последним изменён: $($cache.NewestFiles[0].Path) — $newestText")}
     $recommendations=@($action)
+    Publish-DiagnosticProgress 95 'Запись отчёта'
     [ordered]@{Created=(Get-Date).ToString('o');Guid=$Model.Guid;Name=$Model.Name;ModelPath=$Model.ModelPath;HostNode=$Model.HostNode;Status=$Model.Status;RepeatFailure=$Model.RepeatFailure;HangCount=$Model.HangCount;LastMessage=$Model.LastMessage;Diagnosis=[ordered]@{Reason=$reason;Confidence=$confidence;Evidence=@($evidence);Action=$action};HostCheck=$hostCheck;Acl=$aclInfo;Wcf=[ordered]@{ZeroStreamLengthLines=$zeroStreamLines.Count;PositiveStreamLengthLines=$positiveStreamLines.Count};Cache=$cache;LogContext=$context;Recommendations=$recommendations}|ConvertTo-Json -Depth 10|Set-Content -LiteralPath $report -Encoding UTF8
     [pscustomobject]@{Guid=$Model.Guid;Reason=$reason;Confidence=$confidence;Evidence=@($evidence);Action=$action;HostCheck=$hostCheck;Acl=$aclInfo;Cache=$cache;LogContextCount=$context.Count;Recommendations=$recommendations;ReportPath=$report}
 }
@@ -286,7 +314,7 @@ function Read-SynxIncidentHistory {
 function Write-SynxIncidentHistory {
     param(
         [Parameter(Mandatory)][string]$InstanceRoot,
-        [Parameter(Mandatory)][ValidateSet('FailureDetected','RepairSuccess','RepairFailed','HostAddressMigration','HostAddressMigrationFailed')][string]$Type,
+        [Parameter(Mandatory)][ValidateSet('FailureDetected','RepairSuccess','RepairFailed','HostAddressMigration','HostAddressMigrationFailed','FullCacheClear')][string]$Type,
         [Parameter(Mandatory)][string]$Guid,
         [string]$Name='',
         [string]$ModelPath='',
@@ -309,7 +337,7 @@ function Get-SynxLatestRepairTime {
     param([object[]]$History,[Parameter(Mandatory)][string]$Guid)
     $latest=$null
     foreach($record in @($History)){
-        if(($null-eq$record) -or ([string]$record.Guid -ne $Guid) -or ([string]$record.Type -notin @('RepairSuccess','HostAddressMigration'))){continue}
+        if(($null-eq$record) -or ([string]$record.Guid -ne $Guid) -or ([string]$record.Type -notin @('RepairSuccess','HostAddressMigration','FullCacheClear'))){continue}
         try{$time=[datetime]$record.RecordedAt;if(($null-eq$latest) -or ($time-gt$latest)){$latest=$time}}catch{}
     }
     $latest
@@ -381,30 +409,45 @@ function Get-SynxModelStatus {
 }
 
 function Get-AcceleratorInventory {
-    param([Parameter(Mandatory)]$Instance,[ValidateRange(100,200000)][int]$LogTail=30000)
-    $events=@(Get-AutoSyncLogAnalysis -Paths @($Instance.LogPaths) -Tail $LogTail);$byGuid=@{};$locations=Get-SynxModelLocationMap -Paths @($Instance.LocationDatabases)
+    param([Parameter(Mandatory)]$Instance,[ValidateRange(100,200000)][int]$LogTail=30000,[scriptblock]$ProgressCallback)
+    function Publish-ScanProgress([int]$Percent,[string]$Message){if($ProgressCallback){&$ProgressCallback $Percent $Message}}
+    $outer=$ProgressCallback;$logProgress=$null
+    if($outer){$logProgress={param($p,$t)&$outer ([int]($p*0.5)) $t}.GetNewClosure()}
+    $events=@(Get-AutoSyncLogAnalysis -Paths @($Instance.LogPaths) -Tail $LogTail -ProgressCallback $logProgress);$byGuid=@{}
+    Publish-ScanProgress 50 'Чтение базы имён моделей'
+    $locations=Get-SynxModelLocationMap -Paths @($Instance.LocationDatabases)
+    Publish-ScanProgress 54 'Чтение журнала Synx'
     $history=@(Read-SynxIncidentHistory -InstanceRoot $Instance.Root);$historyPath=Get-SynxHistoryPath $Instance.Root;$historyStatus='ok'
+    # Индексы вместо Where-Object внутри цикла по моделям: при сотнях моделей
+    # и десятках тысяч событий старый вариант был квадратичным.
+    $historyByGuid=@{};foreach($record in $history){$key=[string]$record.Guid;if(-not$historyByGuid.ContainsKey($key)){$historyByGuid[$key]=New-Object Collections.ArrayList};[void]$historyByGuid[$key].Add($record)}
+    $hostErrors=@{};foreach($event in $events){if(($null-ne$event)-and($event.Type-eq'HostResolution')-and$event.HostNode){$hostErrors[[string]$event.HostNode]=$event}}
     foreach($event in @($events)){if(($null-eq$event) -or (-not $event.Guid)){continue};if(-not$byGuid.ContainsKey($event.Guid)){$byGuid[$event.Guid]=New-Object Collections.ArrayList};[void]$byGuid[$event.Guid].Add($event)}
+    Publish-ScanProgress 58 'Проверка Host DB (integrity_check)'
     $rows=@();$dbIntegrity='missing'
     if(Test-Path -LiteralPath $Instance.HostDatabase -PathType Leaf){$dbIntegrity=Get-SynxSqliteIntegrity $Instance.HostDatabase;if($dbIntegrity-eq'ok'){$rows=@(Invoke-SynxSqliteQuery $Instance.HostDatabase 'SELECT lower(ModelIdentityGUID) AS Guid, HostNode FROM HostNodeForCachedModels ORDER BY ModelIdentityGUID;')}}
+    Publish-ScanProgress 63 'Проверка Status DB (integrity_check)'
     $statusIntegrity='missing';$cacheStatus=''
     if(Test-Path -LiteralPath $Instance.StatusDatabase -PathType Leaf){$statusIntegrity=Get-SynxSqliteIntegrity $Instance.StatusDatabase;if($statusIntegrity-eq'ok'){$s=@(Invoke-SynxSqliteQuery $Instance.StatusDatabase 'SELECT CacheStatus FROM CacheStatus LIMIT 1;')|Select-Object -First 1;if($null-ne$s){$cacheStatus=[string]$s.CacheStatus}}}
-    $known=@{};$items=New-Object Collections.ArrayList
+    $known=@{};$items=New-Object Collections.ArrayList;$rowIndex=0
     foreach($row in $rows){
-        $guid=[string]$row.Guid;$known[$guid]=$true;$me=@();if($byGuid.ContainsKey($guid)){$me=@($byGuid[$guid])};$repairTime=Get-SynxLatestRepairTime -History $history -Guid $guid;$eventState=Get-SynxModelEventState $me -After $repairTime;$hangs=@($eventState.Hangs);$errors=@($eventState.Errors);$last=@($eventState.Last);$first=@($eventState.FirstFailure);$lastTime=if($last.Count){$last[0].Time}else{$null};$firstTime=if($first.Count){$first[0].Time}else{$null};$lastMessage=if($last.Count){[string]$last[0].Raw}else{''};$folder=Join-Path $Instance.CachePath $guid;$location=if($locations.ContainsKey($guid)){$locations[$guid]}else{$null}
+        $rowIndex++;if($rowIndex%10-eq1){Publish-ScanProgress (68+[int]($rowIndex*20/[Math]::Max(1,$rows.Count))) "Модели [$rowIndex/$($rows.Count)]"}
+        $guid=[string]$row.Guid;$known[$guid]=$true;$me=@();if($byGuid.ContainsKey($guid)){$me=@($byGuid[$guid])};$repairTime=Get-SynxLatestRepairTime -History $(if($historyByGuid.ContainsKey($guid)){@($historyByGuid[$guid])}else{@()}) -Guid $guid;$eventState=Get-SynxModelEventState $me -After $repairTime;$hangs=@($eventState.Hangs);$errors=@($eventState.Errors);$last=@($eventState.Last);$first=@($eventState.FirstFailure);$lastTime=if($last.Count){$last[0].Time}else{$null};$firstTime=if($first.Count){$first[0].Time}else{$null};$lastMessage=if($last.Count){[string]$last[0].Raw}else{''};$folder=Join-Path $Instance.CachePath $guid;$location=if($locations.ContainsKey($guid)){$locations[$guid]}else{$null}
         $status=Get-SynxModelStatus -EventState $eventState -CacheExists ([bool](Test-Path -LiteralPath $folder -PathType Container)) -HasDbRow $true
         [void]$items.Add([pscustomobject]@{Name=if($location){$location.Name}else{'—'};ModelPath=if($location){$location.ModelPath}else{''};Guid=$guid;HostNode=[string]$row.HostNode;Year=$Instance.Year;Status=$status;HangCount=$hangs.Count;ErrorCount=$errors.Count;LastEvent=$lastTime;EpisodeStart=$firstTime;LastMessage=$lastMessage;CacheExists=[bool](Test-Path -LiteralPath $folder -PathType Container);CachePath=$folder;InstanceRoot=$Instance.Root;HostDatabase=$Instance.HostDatabase;StatusDatabase=$Instance.StatusDatabase})
     }
+    Publish-ScanProgress 88 'Поиск каталогов кэша без записи в Host DB'
     if(Test-Path -LiteralPath $Instance.CachePath){
         foreach($dir in @(Get-ChildItem -LiteralPath $Instance.CachePath -Directory -ErrorAction SilentlyContinue|Where-Object Name -match '^[0-9a-fA-F-]{36}$')){
             $guid=$dir.Name.ToLowerInvariant();if($known.ContainsKey($guid)){continue}
-            $me=@();if($byGuid.ContainsKey($guid)){$me=@($byGuid[$guid])};$repairTime=Get-SynxLatestRepairTime -History $history -Guid $guid;$eventState=Get-SynxModelEventState $me -After $repairTime;$hangs=@($eventState.Hangs);$errors=@($eventState.Errors);$last=@($eventState.Last);$first=@($eventState.FirstFailure)
+            $me=@();if($byGuid.ContainsKey($guid)){$me=@($byGuid[$guid])};$repairTime=Get-SynxLatestRepairTime -History $(if($historyByGuid.ContainsKey($guid)){@($historyByGuid[$guid])}else{@()}) -Guid $guid;$eventState=Get-SynxModelEventState $me -After $repairTime;$hangs=@($eventState.Hangs);$errors=@($eventState.Errors);$last=@($eventState.Last);$first=@($eventState.FirstFailure)
             $status=Get-SynxModelStatus -EventState $eventState -CacheExists $true -HasDbRow $false;$location=if($locations.ContainsKey($guid)){$locations[$guid]}else{$null}
             [void]$items.Add([pscustomobject]@{Name=if($location){$location.Name}else{'—'};ModelPath=if($location){$location.ModelPath}else{''};Guid=$guid;HostNode='';Year=$Instance.Year;Status=$status;HangCount=$hangs.Count;ErrorCount=$errors.Count;LastEvent=if($last.Count){$last[0].Time}else{$null};EpisodeStart=if($first.Count){$first[0].Time}else{$null};LastMessage=if($last.Count){[string]$last[0].Raw}else{''};CacheExists=$true;CachePath=$dir.FullName;InstanceRoot=$Instance.Root;HostDatabase=$Instance.HostDatabase;StatusDatabase=$Instance.StatusDatabase})
         }
     }
+    Publish-ScanProgress 92 'Сопоставление с журналом ремонтов и диагноз'
     foreach($item in @($items)){
-        $guidHistory=@($history|Where-Object{[string]$_.Guid -eq [string]$item.Guid});$repairs=@($guidHistory|Where-Object{$_.Type-in @('RepairSuccess','HostAddressMigration')})
+        $guidHistory=@();if($historyByGuid.ContainsKey([string]$item.Guid)){$guidHistory=@($historyByGuid[[string]$item.Guid])};$repairs=@($guidHistory|Where-Object{$_.Type-in @('RepairSuccess','HostAddressMigration','FullCacheClear')})
         if($item.Status -in @('ЗАВИСАНИЕ','ОШИБКА')){
             $startText=if($item.EpisodeStart){([datetime]$item.EpisodeStart).ToString('o')}elseif($item.LastEvent){([datetime]$item.LastEvent).ToString('o')}else{'unknown'}
             $episodeKey="$($item.Guid)|$startText"
@@ -417,9 +460,9 @@ function Get-AcceleratorInventory {
         $item|Add-Member -NotePropertyName RepairCount -NotePropertyValue $repairs.Count
         $item|Add-Member -NotePropertyName RepeatFailure -NotePropertyValue $repeat
         $item|Add-Member -NotePropertyName RepeatText -NotePropertyValue $(if($repeat){'ПОВТОР'}else{''})
-        $matchingHostErrors=@($events|Where-Object{$_.Type-eq'HostResolution'-and$_.HostNode-and([string]$_.HostNode-eq[string]$item.HostNode)})
+        $hostError=if($item.HostNode-and$hostErrors.ContainsKey([string]$item.HostNode)){$hostErrors[[string]$item.HostNode]}else{$null}
         $diagnosis='Отклонений не найдено';$confidence='—';$evidence='Логи не содержат актуальной ошибки';$action='Наблюдение не требуется.'
-        if($matchingHostErrors.Count){$diagnosis='Host не разрешается';$confidence='Высокая';$evidence=[string]$matchingHostErrors[-1].Raw;$action='Проверить DNS/IP и доступность порта Host.'}
+        if($null-ne$hostError){$diagnosis='Host не разрешается';$confidence='Высокая';$evidence=[string]$hostError.Raw;$action='Проверить DNS/IP и доступность порта Host.'}
         elseif($item.LastMessage-match'(?i)access.+denied|unauthorized'){$diagnosis='Отказ в доступе к файлам';$confidence='Высокая';$evidence=$item.LastMessage;$action='Запустить глубокую диагностику ACL и файлов кэша.'}
         elseif($item.LastMessage-match'(?i)locked by another process|sharing violation'){$diagnosis='Файл удерживается процессом';$confidence='Высокая';$evidence=$item.LastMessage;$action='Определить удерживающий процесс и проверить состояние IIS/AutoSync.'}
         elseif($repeat-and$item.Status-eq'ЗАВИСАНИЕ'){$diagnosis='Повтор после очистки кэша';$confidence='Средняя';$evidence="Тот же GUID снова завис; строк зависания: $($item.HangCount)";$action='Проверить Data_Sync, фактическое чтение файлов и центральную модель.'}
@@ -834,4 +877,113 @@ function Invoke-SynxHostAddressMigration {
     }
 }
 
-Export-ModuleMember -Function Get-SynxModelStatus,Restore-SynxDatabaseSet,Get-SynxAppPoolInventory,Select-SynxRepairPools,Get-SynxPoolNameFromCommandLine,Get-SynxPoolWorkerProcesses,Initialize-SynxSqlite,Invoke-SynxSqliteQuery,Invoke-SynxSqliteExecute,Get-SynxSqliteIntegrity,ConvertFrom-AutoSyncLogLine,Get-AutoSyncLogAnalysis,Find-AutoSyncLogs,Get-RevitAcceleratorInstances,ConvertFrom-SynxGuidHex,Get-SynxModelLocationMap,Split-SynxHostNode,Get-SynxHostAddressSummary,Test-SynxHostEndpoint,Import-SynxHostModelNames,Test-SynxCacheFiles,Get-SynxGuidLogContext,Test-SynxModelDiagnostics,Get-SynxHistoryPath,Read-SynxIncidentHistory,Write-SynxIncidentHistory,Get-SynxLatestRepairTime,Get-SynxModelEventState,Get-AcceleratorInventory,Test-SynxAdministrator,ConvertTo-SynxAppPoolState,Get-SynxWebAppPoolState,Get-AcceleratorRepairTargets,New-AcceleratorRepairPreview,Stop-SynxLingeringPoolWorkers,Set-SynxCacheRepairAccess,Move-SynxCacheDirectory,Invoke-AcceleratorModelRepair,Invoke-SynxHostAddressMigration
+function Invoke-SynxFullCacheClear {
+    # Полная очистка кэша экземпляра. Ничего не удаляется: всё содержимое Cache
+    # (каталоги GUID, HostNodeForCachedModels.db3, LocalServer_Cache.db3 вместе
+    # с -wal/-shm) перемещается в карантин на том же томе — это мгновенно и
+    # обратимо. Сам каталог Cache остаётся на месте, чтобы не потерять ACL,
+    # выданные установщиком пулу IIS.
+    [CmdletBinding(SupportsShouldProcess=$true,ConfirmImpact='High')]
+    param([Parameter(Mandatory)]$Instance,[scriptblock]$ProgressCallback)
+    function Publish-ClearProgress([int]$Percent,[string]$Message){if($ProgressCallback){&$ProgressCallback $Percent $Message}}
+
+    Publish-ClearProgress 2 'Проверка экземпляра и прав'
+    if(-not(Test-SynxAdministrator)){throw 'Запустите Windows PowerShell от имени администратора.'}
+    $cache=[IO.Path]::GetFullPath([string]$Instance.CachePath).TrimEnd('\')
+    if($cache-ne[IO.Path]::GetFullPath((Join-Path ([string]$Instance.Root) 'Cache')).TrimEnd('\')){throw 'Путь кэша не соответствует экземпляру Revit Server.'}
+    if(-not(Test-Path -LiteralPath $cache -PathType Container)){throw "Каталог кэша не найден: $cache"}
+    if(@(Get-ChildItem -LiteralPath $cache -Force -ErrorAction Stop).Count-eq0){Publish-ClearProgress 100 'Кэш уже пуст';return [pscustomobject]@{Status='Empty';Message='Кэш уже пуст.';ActionRoot='';Quarantine='';ItemCount=0;GuidCount=0}}
+    if(-not$PSCmdlet.ShouldProcess($cache,'Полная очистка кэша Accelerator')){return [pscustomobject]@{Status='Skipped';Message='Отменено'}}
+
+    $stamp=Get-Date -Format yyyy-MM-dd_HHmmss
+    $root=Join-Path (Join-Path ([string]$Instance.Root) 'SynxBackup') "FullCacheClear_$stamp"
+    $quarantine=Join-Path (Join-Path ([string]$Instance.Root) 'SynxQuarantine') "FullCache_$stamp"
+    New-Item -ItemType Directory -Path $root,$quarantine -Force|Out-Null
+
+    Publish-ClearProgress 6 'Поиск AutoSync и IIS-пула'
+    $targets=Get-AcceleratorRepairTargets ([pscustomobject]@{Year=$Instance.Year;InstanceRoot=$Instance.Root})
+    if($targets.Services.Count-eq0){throw "Служба Revit Server AutoSync $($Instance.Year) не найдена. Файлы не изменены."}
+    if($targets.Pools.Count-eq0){throw "IIS-пул Revit Server $($Instance.Year) не найден. $($targets.PoolError) Файлы не изменены."}
+
+    # Список GUID нужен журналу: следующий сбой любой модели — повтор после очистки.
+    $guids=@{}
+    foreach($dir in @(Get-ChildItem -LiteralPath $cache -Directory -Force -ErrorAction SilentlyContinue)){if($dir.Name-match'^[0-9a-fA-F-]{36}$'){$guids[$dir.Name.ToLowerInvariant()]=$true}}
+    try{foreach($row in @(Invoke-SynxSqliteQuery $Instance.HostDatabase 'SELECT lower(ModelIdentityGUID) AS Guid FROM HostNodeForCachedModels;')){if($row.Guid){$guids[[string]$row.Guid]=$true}}}catch{}
+
+    $moved=New-Object Collections.ArrayList
+    $manifest=[ordered]@{Created=Get-Date;InstanceRoot=$Instance.Root;CachePath=$cache;Quarantine=$quarantine;Guids=@($guids.Keys|Sort-Object);Services=@($targets.Services|Select-Object Name,DisplayName,State);Pools=@($targets.Pools);Result='Started'}
+    try{
+        Publish-ClearProgress 10 'Сохранение плана очистки'
+        $manifest|ConvertTo-Json -Depth 6|Set-Content (Join-Path $root 'manifest-before.json') -Encoding UTF8
+
+        Publish-ClearProgress 15 'Остановка AutoSync и IIS-пула'
+        Set-SynxRuntimeState $targets Stop
+
+        # Список заново: за время остановки службы могли дописать или убрать файлы.
+        $items=@(Get-ChildItem -LiteralPath $cache -Force -ErrorAction Stop)
+        for($i=0;$i-lt$items.Count;$i++){
+            $item=$items[$i];$percent=25+[int]($i*55/[Math]::Max(1,$items.Count));$destination=Join-Path $quarantine $item.Name
+            Publish-ClearProgress $percent "Перемещение в карантин [$($i+1)/$($items.Count)] $($item.Name)"
+            if($item.PSIsContainer){
+                # Замыкание обязательно: без него $ProgressCallback внутри вызова
+                # находится в области Move-SynxCacheDirectory — это сам $step.
+                $cb=$ProgressCallback;$step={param($p,$t)if($cb){&$cb $percent $t}}.GetNewClosure()
+                if(Move-SynxCacheDirectory -Source $item.FullName -Destination $destination -ProgressCallback $step){[void]$moved.Add([pscustomobject]@{Source=$item.FullName;Destination=$destination})}
+            }else{
+                $done=$false;$lastError=''
+                for($attempt=1;($attempt-le8)-and(-not$done);$attempt++){try{[IO.File]::Move($item.FullName,$destination);$done=$true}catch{$lastError=$_.Exception.Message;Start-Sleep -Seconds 1}}
+                if(-not$done){throw "Файл занят и не перемещён после 8 попыток: $($item.Name) — $lastError"}
+                [void]$moved.Add([pscustomobject]@{Source=$item.FullName;Destination=$destination})
+            }
+        }
+
+        Publish-ClearProgress 82 'Проверка: активный кэш пуст'
+        $left=@(Get-ChildItem -LiteralPath $cache -Force -ErrorAction Stop)
+        if($left.Count){throw "В активном кэше остались элементы: $(@($left|Select-Object -First 5|ForEach-Object{$_.Name})-join', ')"}
+
+        Publish-ClearProgress 88 'Запуск IIS-пула и AutoSync'
+        Set-SynxRuntimeState $targets Start
+        $manifest.Result='Changed';$manifest.Completed=Get-Date;$manifest.Moved=@($moved);$manifest|ConvertTo-Json -Depth 6|Set-Content (Join-Path $root 'manifest-after.json') -Encoding UTF8
+
+        $q={param($v) "'"+([string]$v).Replace("'","''")+"'"}
+        @(
+            "# RevitServer Synx — откат полной очистки кэша. Запускать от имени администратора.",
+            "# Текущее содержимое Cache (то, что Accelerator успел скачать заново) не удаляется, а уходит в <карантин>_replaced.",
+            "`$ErrorActionPreference='Stop'",
+            "`$services=@($(@(@($targets.Services)|ForEach-Object{& $q $_.Name})-join','))",
+            "`$pools=@($(@(@($targets.Pools)|ForEach-Object{& $q $_.Name})-join','))",
+            "`$cache=$(& $q $cache)",
+            "`$quarantine=$(& $q $quarantine)",
+            "`$replaced=`$quarantine+'_replaced'",
+            "Import-Module WebAdministration -ErrorAction SilentlyContinue",
+            "foreach(`$s in `$services){ if(Get-Service -Name `$s -ErrorAction SilentlyContinue){ Stop-Service -Name `$s -Force } }",
+            "foreach(`$p in `$pools){ try{ Stop-WebAppPool -Name `$p -ErrorAction SilentlyContinue }catch{} }",
+            "Start-Sleep -Seconds 10",
+            "New-Item -ItemType Directory -Path `$replaced -Force|Out-Null",
+            "foreach(`$i in @(Get-ChildItem -LiteralPath `$cache -Force)){ [IO.Directory]::Move(`$i.FullName,(Join-Path `$replaced `$i.Name)) }",
+            "foreach(`$i in @(Get-ChildItem -LiteralPath `$quarantine -Force)){ [IO.Directory]::Move(`$i.FullName,(Join-Path `$cache `$i.Name)) }",
+            "foreach(`$p in `$pools){ try{ Start-WebAppPool -Name `$p }catch{} }",
+            "foreach(`$s in `$services){ try{ Start-Service -Name `$s }catch{} }",
+            "Write-Host 'Откат завершён. Проверьте открытие и синхронизацию моделей.' -ForegroundColor Green"
+        )|Set-Content (Join-Path $root 'Rollback.ps1') -Encoding UTF8
+
+        Publish-ClearProgress 95 'Запись в журнал Synx'
+        $historySaved=$true
+        foreach($guid in @($guids.Keys)){try{[void](Write-SynxIncidentHistory -InstanceRoot $Instance.Root -Type FullCacheClear -Guid $guid -Status 'CACHE_CLEARED' -ActionRoot $root -Message 'Полная очистка кэша экземпляра; данные в карантине.')}catch{$historySaved=$false}}
+        Publish-ClearProgress 100 "Готово: кэш очищен, в карантине элементов: $($moved.Count)"
+        [pscustomobject]@{Status='Changed';Message='Весь кэш перемещён в карантин; компоненты запущены, модели загрузятся с Host заново.';ActionRoot=$root;Quarantine=$quarantine;ItemCount=$moved.Count;GuidCount=$guids.Count;HistorySaved=$historySaved}
+    }catch{
+        $errorText=$_.Exception.Message
+        try{
+            Publish-ClearProgress 85 'Ошибка: возврат кэша из карантина'
+            Set-SynxRuntimeState $targets Stop
+            for($i=$moved.Count-1;$i-ge0;$i--){$m=$moved[$i];if((Test-Path -LiteralPath $m.Destination)-and(-not(Test-Path -LiteralPath $m.Source))){[IO.Directory]::Move([string]$m.Destination,[string]$m.Source)}}
+            Set-SynxRuntimeState $targets Start
+            Publish-ClearProgress 100 'Откат завершён'
+        }catch{$errorText+="; откат: $($_.Exception.Message)"}
+        $manifest.Result='Failed';$manifest.Error=$errorText;$manifest|ConvertTo-Json -Depth 6|Set-Content (Join-Path $root 'manifest-error.json') -Encoding UTF8
+        throw $errorText
+    }
+}
+
+Export-ModuleMember -Function Invoke-SynxFullCacheClear,Get-SynxModelStatus,Restore-SynxDatabaseSet,Get-SynxAppPoolInventory,Select-SynxRepairPools,Get-SynxPoolNameFromCommandLine,Get-SynxPoolWorkerProcesses,Initialize-SynxSqlite,Invoke-SynxSqliteQuery,Invoke-SynxSqliteExecute,Get-SynxSqliteIntegrity,ConvertFrom-AutoSyncLogLine,Get-AutoSyncLogAnalysis,Find-AutoSyncLogs,Get-RevitAcceleratorInstances,ConvertFrom-SynxGuidHex,Get-SynxModelLocationMap,Split-SynxHostNode,Get-SynxHostAddressSummary,Test-SynxHostEndpoint,Import-SynxHostModelNames,Test-SynxCacheFiles,Get-SynxGuidLogContext,Test-SynxModelDiagnostics,Get-SynxHistoryPath,Read-SynxIncidentHistory,Write-SynxIncidentHistory,Get-SynxLatestRepairTime,Get-SynxModelEventState,Get-AcceleratorInventory,Test-SynxAdministrator,ConvertTo-SynxAppPoolState,Get-SynxWebAppPoolState,Get-AcceleratorRepairTargets,New-AcceleratorRepairPreview,Stop-SynxLingeringPoolWorkers,Set-SynxCacheRepairAccess,Move-SynxCacheDirectory,Invoke-AcceleratorModelRepair,Invoke-SynxHostAddressMigration

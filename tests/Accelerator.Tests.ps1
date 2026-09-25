@@ -18,7 +18,7 @@ Describe 'GitHub bootstrap' {
     Add-Type -AssemblyName PresentationFramework
     $reader=New-Object Xml.XmlNodeReader $xaml
     $view=[Windows.Markup.XamlReader]::Load($reader)
-    foreach($name in @('ModelsGrid','ErrorsGrid','DiagnosisCard','DiagnosisTitleText','DiagnosisConfidenceText','DiagnosisEvidenceText','DiagnosisActionText','RepairButton','BatchRepairButton','CacheCheckButton','OpenDiagnosticButton','OldHostCombo','NewHostText','TestHostButton','MigrateHostButton','LoadHostNamesButton','OpenHistoryButton','RepairProgress','RepairDetails')){
+    foreach($name in @('ModelsGrid','ErrorsGrid','DiagnosisCard','DiagnosisTitleText','DiagnosisConfidenceText','DiagnosisEvidenceText','DiagnosisActionText','RepairButton','BatchRepairButton','CacheCheckButton','OpenDiagnosticButton','OldHostCombo','NewHostText','TestHostButton','MigrateHostButton','LoadHostNamesButton','OpenHistoryButton','RepairProgress','RepairDetails','ClearCacheButton','JobProgress')){
       $xamlText|Should -Match ('x:Name="'+[regex]::Escape($name)+'"')
       $view.FindName($name)|Should -Not -BeNullOrEmpty
     }
@@ -70,6 +70,30 @@ Describe 'Cache quarantine move' {
     Test-Path -LiteralPath $source|Should -BeFalse;Test-Path -LiteralPath (Join-Path $destination 'Data\sample.bin')|Should -BeTrue
   }
 }
+Describe 'Full cache clear' {
+  BeforeEach {
+    Mock -ModuleName Accelerator Test-SynxAdministrator {$true}
+    Mock -ModuleName Accelerator Get-AcceleratorRepairTargets {[pscustomobject]@{Services=@([pscustomobject]@{Name='FakeSync';DisplayName='Fake';State='Running'});Pools=@([pscustomobject]@{Name='RevitServerAppPool2022';State='Started'});PoolError=''}}
+    Mock -ModuleName Accelerator Set-SynxRuntimeState {}
+    $root=Join-Path $TestDrive ('Revit Server 2022_'+[guid]::NewGuid().ToString('N'));$cache=Join-Path $root 'Cache'
+    New-Item -ItemType Directory -Path (Join-Path $cache '11111111-2222-4333-8444-555555555555\Data') -Force|Out-Null;Set-Content -LiteralPath (Join-Path $cache 'HostNodeForCachedModels.db3') -Value 'x'
+    $instance=[pscustomobject]@{Year='2022';Root=$root;CachePath=$cache;HostDatabase=(Join-Path $cache 'HostNodeForCachedModels.db3')}
+  }
+  It 'moves everything to quarantine, keeps the Cache folder and writes a rollback script' {
+    $result=Invoke-SynxFullCacheClear -Instance $instance -Confirm:$false
+    Test-Path -LiteralPath $cache -PathType Container|Should -BeTrue
+    @(Get-ChildItem -LiteralPath $cache -Force).Count|Should -Be 0
+    @(Get-ChildItem -LiteralPath $result.Quarantine -Force).Count|Should -Be 2
+    Test-Path -LiteralPath (Join-Path $result.ActionRoot 'Rollback.ps1')|Should -BeTrue
+    Should -Invoke -ModuleName Accelerator Set-SynxRuntimeState -Times 2 -Exactly
+  }
+  It 'returns every item from quarantine when a step fails' {
+    $script:failedOnce=$false
+    Mock -ModuleName Accelerator Set-SynxRuntimeState {if($Action-eq'Start'-and-not$script:failedOnce){$script:failedOnce=$true;throw 'start failed'}}
+    {Invoke-SynxFullCacheClear -Instance $instance -Confirm:$false}|Should -Throw
+    @(Get-ChildItem -LiteralPath $cache -Force).Count|Should -Be 2
+  }
+}
 Describe 'Cache file inspection' {
   It 'writes a report and detects a zero-length file' {
     $cache=Join-Path $TestDrive 'Cache\11111111-2222-4333-8444-555555555555';$reports=Join-Path $TestDrive 'reports';New-Item -ItemType Directory -Path $cache -Force|Out-Null;[IO.File]::WriteAllBytes((Join-Path $cache 'empty.bin'),[byte[]]@())
@@ -94,6 +118,10 @@ Describe 'Cache file inspection' {
 Describe 'AutoSync log parser' {
   It 'handles models with no log events' {$state=Get-SynxModelEventState -Events @();$state.Hangs.Count|Should -Be 0;$state.Errors.Count|Should -Be 0;$state.Last.Count|Should -Be 0}
   It 'handles an empty log path list' {@(Get-AutoSyncLogAnalysis -Paths @()).Count|Should -Be 0}
+  It 'fast pre-filter keeps context GUID from info lines for later up-to-date lines' {
+    $log=Join-Path $TestDrive 'Context.log';@('2026-09-15 00:01:00,000 INFO MSG(Comment: start C:\Cache\11111111-2222-4333-8444-555555555555\Data)','2026-09-15 00:02:00,000 INFO MSG(Comment: Data is up-to-date with central.)','2026-09-15 00:03:00,000 INFO MSG(Comment: plain line)')|Set-Content -LiteralPath $log -Encoding UTF8
+    $events=@(Get-AutoSyncLogAnalysis -Paths @($log));$events.Count|Should -Be 1;$events[0].Type|Should -Be 'UpToDate';$events[0].Guid|Should -Be '11111111-2222-4333-8444-555555555555';$events[0].LogPath|Should -Be $log
+  }
   It 'extracts a stuck cache GUID and loop number' {$line='2026-09-15 00:06:37,750 INFO TID(6) LOGGER(ServerLogger) MSG(Comment: Loop 453 : 1 threads are still not done for Model: C:\ProgramData\Autodesk\Revit Server 2022\Cache\11111111-2222-4333-8444-555555555555\Data)';$event=ConvertFrom-AutoSyncLogLine $line;$event.Type|Should -Be 'StuckThread';$event.Guid|Should -Be '11111111-2222-4333-8444-555555555555';$event.Loop|Should -Be 453}
   It 'classifies host lookup failures' {$event=ConvertFrom-AutoSyncLogLine '2026-09-15 00:26:42,532 INFO MSG(Comment: Failed to get IP addresses for 203.0.113.10:36942: No such host is known)';$event.Type|Should -Be 'HostResolution';$event.Level|Should -Be 'WARN';$event.HostNode|Should -Be '203.0.113.10:36942'}
   It 'recognizes successful synchronization' {(ConvertFrom-AutoSyncLogLine '2026-09-15 00:26:43,208 INFO MSG(Comment: Data is up-to-date with central.)').Level|Should -Be 'OK'}
