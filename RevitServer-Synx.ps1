@@ -24,7 +24,7 @@ function Update-Buttons{
   $c.CacheCheckButton.IsEnabled=[bool]($idle-and$exists)
   $c.OpenCacheButton.IsEnabled=$exists
   $c.BatchRepairButton.IsEnabled=[bool]($idle-and$isAdmin-and($stuck-gt0))
-  $c.MigrateHostButton.IsEnabled=[bool]($idle-and$isAdmin-and($null-ne$script:hostTest)-and$script:hostTest.Resolved-and$script:hostTest.AllPortsOpen)
+  $c.MigrateHostButton.IsEnabled=[bool]($idle-and$isAdmin-and($null-ne$c.InstanceCombo.SelectedItem)-and($null-ne$c.OldHostCombo.SelectedItem)-and(-not[string]::IsNullOrWhiteSpace($c.NewHostText.Text)))
   $c.ClearCacheButton.IsEnabled=[bool]($idle-and$isAdmin-and($null-ne$c.InstanceCombo.SelectedItem))
   $c.OpenHistoryButton.IsEnabled=[bool](($null-ne$script:analysis)-and(Test-Path -LiteralPath $script:analysis.HistoryPath -PathType Leaf))
   $c.OpenDiagnosticButton.IsEnabled=[bool]($script:lastDiagnosticPath-and(Test-Path -LiteralPath $script:lastDiagnosticPath -PathType Leaf))
@@ -157,7 +157,7 @@ $c.TestHostButton.Add_Click({
     $script:hostTest=$Result;Update-Buttons
     $checks=@($Result.Checks|ForEach-Object{"$($_.Port): $(if($_.Open){'доступен'}else{'НЕТ СОЕДИНЕНИЯ'})"})
     $c.HostStatusText.Text="DNS/IP: $(@($Result.ResolvedAddresses)-join', '); $($checks-join'; ')";$c.StatusText.Text='Проверка адреса завершена'
-    if(-not$Result.AllPortsOpen){Show-Error "Новый Host не отвечает на всех используемых портах. Миграция заблокирована.`n`n$($checks-join"`n")"}
+    if(-not$Result.AllPortsOpen){Show-Error "Новый Host не отвечает на всех используемых портах. Смену адреса можно выполнить без успешной проверки.`n`n$($checks-join"`n")"}
   }
 })
 $c.LoadHostNamesButton.Add_Click({
@@ -174,9 +174,9 @@ $c.LoadHostNamesButton.Add_Click({
   }
 })
 $c.MigrateHostButton.Add_Click({
-  $instance=$c.InstanceCombo.SelectedItem;$group=$c.OldHostCombo.SelectedItem;if(($null-eq$instance)-or($null-eq$group)-or($null-eq$script:hostTest)){return};$new=$c.NewHostText.Text.Trim()
+  $instance=$c.InstanceCombo.SelectedItem;$group=$c.OldHostCombo.SelectedItem;if(($null-eq$instance)-or($null-eq$group)-or[string]::IsNullOrWhiteSpace($c.NewHostText.Text)){return};$new=$c.NewHostText.Text.Trim()
   $affectedGuids=@($group.Models|ForEach-Object{$_.Guid});$named=@($script:analysis.Models|Where-Object{$affectedGuids-contains$_.Guid});$lines=@($named|ForEach-Object{"$(if($_.Name-ne'—'){$_.Name}else{$_.Guid}) — $($_.HostNode)"});$list=($lines|Select-Object -First 14)-join"`n";if($lines.Count-gt14){$list+="`n... и ещё $($lines.Count-14)"}
-  $message="Системная смена Host для $($group.ModelCount) моделей:`n$($group.Address) → $new`nПорты сохраняются: $($group.Ports)`n`n$list`n`nAutoSync и IIS-пул будут остановлены. Будет создан бэкап ТОЛЬКО баз; все затронутые кэши переместятся в карантин и загрузятся заново с нового Host. При ошибке выполняется откат.`n`nПродолжить?"
+  $message="Системная смена Host для $($group.ModelCount) моделей:`n$($group.Address) → $new`nПорты сохраняются: $($group.Ports)`nДоступность нового Host не является обязательным условием смены адреса.`n`n$list`n`nAutoSync и IIS-пул будут остановлены. Будет создан бэкап ТОЛЬКО баз; все затронутые кэши переместятся в карантин и загрузятся заново с нового Host. При ошибке выполняется откат.`n`nПродолжить?"
   if(-not(Confirm-Action $message 'Миграция адреса Revit Server Host')){return}
   Start-SynxJob -Critical -Title 'Выполняется миграция Host. Не закрывайте окно...' -Arguments @{Instance=$instance;OldAddress=$group.Address;NewAddress=$new;Models=@($script:analysis.Models)} -Work {
     param($Instance,$OldAddress,$NewAddress,$Models,$Progress)
