@@ -1,4 +1,4 @@
-﻿<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="RevitServer Synx" Width="1500" Height="920" MinWidth="1100" MinHeight="680" WindowStartupLocation="CenterScreen" Background="#F1F5F9" FontFamily="Segoe UI" FontSize="13" Foreground="#0F172A" UseLayoutRounding="True" SnapsToDevicePixels="True" TextOptions.TextFormattingMode="Display">
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="RevitServer Synx" Width="1500" Height="920" MinWidth="1100" MinHeight="680" WindowStartupLocation="CenterScreen" Background="#F1F5F9" FontFamily="Segoe UI" FontSize="13" Foreground="#0F172A" UseLayoutRounding="True" SnapsToDevicePixels="True" TextOptions.TextFormattingMode="Display">
   <Window.Resources>
     <SolidColorBrush x:Key="Accent" Color="#0369A1"/>
     <SolidColorBrush x:Key="AccentDark" Color="#075985"/>
@@ -115,6 +115,7 @@
                 </DataGridTemplateColumn>
                 <DataGridTemplateColumn Header="Модель" SortMemberPath="Name" Width="1.5*" MinWidth="220"><DataGridTemplateColumn.CellTemplate><DataTemplate><StackPanel VerticalAlignment="Center"><TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{Binding ModelPath}"/><TextBlock Text="{Binding Guid}" FontFamily="Consolas" FontSize="11" Foreground="#94A3B8" TextTrimming="CharacterEllipsis"/></StackPanel></DataTemplate></DataGridTemplateColumn.CellTemplate></DataGridTemplateColumn>
                 <DataGridTextColumn Header="Предполагаемая причина" Binding="{Binding Diagnosis}" Width="*" MinWidth="170"><DataGridTextColumn.ElementStyle><Style TargetType="TextBlock"><Setter Property="TextTrimming" Value="CharacterEllipsis"/></Style></DataGridTextColumn.ElementStyle></DataGridTextColumn>
+                <DataGridTextColumn Header="Последнее событие" Binding="{Binding LastEvent, StringFormat=HH:mm:ss}" Width="Auto"/>
                 <DataGridTextColumn Header="Зависаний" Binding="{Binding HangCount}" Width="Auto"/>
                 <DataGridTextColumn Header="Ошибок" Binding="{Binding ErrorCount}" Width="Auto"/>
                 <DataGridTextColumn Header="Случаев" Binding="{Binding IncidentCount}" Width="Auto"/>
@@ -124,7 +125,7 @@
               </DataGrid.Columns>
             </DataGrid>
           </TabItem>
-          <TabItem x:Name="ErrorsTab" Header="Ошибки AutoSync">
+          <TabItem x:Name="ErrorsTab" Header="События AutoSync">
             <DataGrid x:Name="ErrorsGrid">
               <DataGrid.Columns>
                 <DataGridTextColumn Header="Время" Binding="{Binding Time, StringFormat=dd.MM HH:mm:ss}" Width="Auto"/>

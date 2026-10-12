@@ -9,7 +9,12 @@ foreach($name in $names){$control=$window.FindName($name);if($null-eq$control){t
 $script:job=$null;$script:batchLimit=5
 $isAdmin=Test-SynxAdministrator;$c.AdminStatusText.Text=if($isAdmin){'Администратор — ремонт доступен'}else{'Только просмотр — для ремонта нужны права администратора'};if(-not$isAdmin){$c.AdminBadge.Background='#78350F';$c.AdminStatusText.Foreground='#FEF3C7'};$script:instances=@();$script:analysis=$null;$script:hostTest=$null;$script:lastDiagnosticPath=''
 function Show-Error([string]$Message){[void][Windows.MessageBox]::Show($window,$Message,'RevitServer Synx',[Windows.MessageBoxButton]::OK,[Windows.MessageBoxImage]::Error)}
-function Confirm-Action([string]$Message,[string]$Title){[Windows.MessageBox]::Show($window,$Message,$Title,[Windows.MessageBoxButton]::YesNo,[Windows.MessageBoxImage]::Warning)-eq[Windows.MessageBoxResult]::Yes}
+function Confirm-Action([string]$Message,[string]$Title){
+  # Модальный диалог продолжает обрабатывать таймеры WPF.
+  $script:liveTimer.Stop()
+  try{[Windows.MessageBox]::Show($window,$Message,$Title,[Windows.MessageBoxButton]::YesNo,[Windows.MessageBoxImage]::Warning)-eq[Windows.MessageBoxResult]::Yes}
+  finally{if($null-ne$script:analysis){$script:liveTimer.Start()}}
+}
 function Set-DiagnosisPanel($Model,[string]$Reason,[string]$Confidence,[string]$Evidence,[string]$Action){
   if($null-eq$Model){$c.DiagnosisTitleText.Text='Сначала выберите модель';$c.DiagnosisConfidenceText.Text='Уверенность: —';$c.DiagnosisEvidenceText.Text='Доказательства появятся после анализа.';$c.DiagnosisActionText.Text='—';$c.DiagnosisCard.Background='#F8FAFC';$c.DiagnosisCard.BorderBrush='#CBD5E1';return}
   $c.DiagnosisTitleText.Text=$Reason;$c.DiagnosisConfidenceText.Text="Уверенность: $Confidence";$c.DiagnosisEvidenceText.Text=$Evidence;$c.DiagnosisActionText.Text=$Action
@@ -19,6 +24,7 @@ function Update-Buttons{
   $idle=$null-eq$script:job;$m=$c.ModelsGrid.SelectedItem
   $exists=[bool](($null-ne$m)-and(Test-Path -LiteralPath $m.CachePath))
   foreach($name in @('RefreshButton','InstanceCombo','LoadNamesButton','LoadHostNamesButton','TestHostButton','OldHostCombo','NewHostText','ModelsGrid')){$c[$name].IsEnabled=$idle}
+  if($script:job -and $script:job.Background){$c.ModelsGrid.IsEnabled=$true}
   $stuck=0;if($null-ne$script:analysis){$stuck=@($script:analysis.Models|Where-Object{$_.Status-eq'ЗАВИСАНИЕ'}).Count}
   $c.RepairButton.IsEnabled=[bool]($idle-and$isAdmin-and($null-ne$m))
   $c.CacheCheckButton.IsEnabled=[bool]($idle-and$exists)
@@ -45,12 +51,12 @@ $script:jobBootstrap={
 }
 function Start-SynxJob{
   # Critical — работа меняет службы и файлы: окно нельзя закрыть, шаги пишутся в журнал ремонта.
-  param([Parameter(Mandatory)][string]$Title,[Parameter(Mandatory)][scriptblock]$Work,[hashtable]$Arguments=@{},[Parameter(Mandatory)][scriptblock]$OnDone,$Context=$null,[switch]$Critical)
+  param([Parameter(Mandatory)][string]$Title,[Parameter(Mandatory)][scriptblock]$Work,[hashtable]$Arguments=@{},[Parameter(Mandatory)][scriptblock]$OnDone,$Context=$null,[switch]$Critical,[switch]$Background)
   if($null-ne$script:job){return}
   $sync=[hashtable]::Synchronized(@{Percent=0;Text=$Title;Log=[Collections.ArrayList]::Synchronized((New-Object Collections.ArrayList));Result=$null;Error=$null})
   $ps=[PowerShell]::Create()
   [void]$ps.AddScript($script:jobBootstrap.ToString()).AddArgument($modulePath).AddArgument($sync).AddArgument($Work.ToString()).AddArgument($Arguments)
-  $script:job=[pscustomobject]@{PS=$ps;Handle=$null;Sync=$sync;OnDone=$OnDone;Context=$Context;Critical=[bool]$Critical;LogIndex=0}
+  $script:job=[pscustomobject]@{PS=$ps;Handle=$null;Sync=$sync;OnDone=$OnDone;Context=$Context;Critical=[bool]$Critical;Background=[bool]$Background;LogIndex=0}
   $script:job.Handle=$ps.BeginInvoke()
   $c.JobProgress.Value=0;$c.JobProgress.Visibility='Visible';$c.StatusText.Text=$Title
   if($Critical){$c.RepairProgress.Value=0;$c.RepairStepText.Text="0% — $Title";$c.RepairDetails.Clear()}
@@ -82,44 +88,52 @@ $window.Add_Closing({param($sender,$e)
 
 function Load-Instances{try{$script:instances=@(Get-RevitAcceleratorInstances);$c.InstanceCombo.ItemsSource=$script:instances;if($script:instances.Count){$c.InstanceCombo.SelectedIndex=0;$c.SummaryText.Text="Найдено экземпляров: $($script:instances.Count). Нажмите «Прочитать логи и базы»."}else{$c.SummaryText.Text='Revit Server Accelerator в ProgramData не найден.'};Update-Buttons}catch{Show-Error $_.Exception.Message}}
 function Show-Analysis($Result){
+  $selectedGuid=if($c.ModelsGrid.SelectedItem){[string]$c.ModelsGrid.SelectedItem.Guid}else{''}
   $script:analysis=$Result.Analysis;$models=@($script:analysis.Models);$visibleEvents=@($Result.VisibleEvents);$stuck=0;$bad=0
   foreach($model in $models){if($model.Status-eq'ЗАВИСАНИЕ'){$stuck++}elseif($model.Status-eq'ОШИБКА'){$bad++}}
   $c.ModelsGrid.ItemsSource=$models;$c.ErrorsGrid.ItemsSource=$visibleEvents
-  $c.ModelsTab.Header="Модели · $($models.Count)";$c.ErrorsTab.Header="Ошибки AutoSync · $($visibleEvents.Count)"
+  foreach($model in $models){if($model.Guid-eq$selectedGuid){$c.ModelsGrid.SelectedItem=$model;break}}
+  $c.ModelsTab.Header="Модели · $($models.Count)";$c.ErrorsTab.Header="События AutoSync · $($visibleEvents.Count)"
   $repeat=@($models|Where-Object RepeatFailure).Count
   $oldSelection=if($null-ne$c.OldHostCombo.SelectedItem){[string]$c.OldHostCombo.SelectedItem.Address}else{''};$hostGroups=@($Result.Hosts);$c.OldHostCombo.ItemsSource=$hostGroups
-  $preferred='';foreach($event in @($visibleEvents)){if($event.Type-eq'HostResolution'-and$event.HostNode){$preferred=(Split-SynxHostNode ([string]$event.HostNode)).Address;break}}
+  $preferred='';if(-not$oldSelection){foreach($event in @($visibleEvents)){if($event.Type-eq'HostResolution'-and$event.HostNode){$preferred=(Split-SynxHostNode ([string]$event.HostNode)).Address;break}}}
   for($i=0;$i-lt$hostGroups.Count;$i++){if(($preferred-and$hostGroups[$i].Address-eq$preferred)-or((-not$preferred)-and$oldSelection-and$hostGroups[$i].Address-eq$oldSelection)){$c.OldHostCombo.SelectedIndex=$i;break}}
   if(($c.OldHostCombo.SelectedIndex-lt0)-and$hostGroups.Count){$c.OldHostCombo.SelectedIndex=0}
   if($preferred){$c.HostExpander.IsExpanded=$true}
   $c.HostStatusText.Text=if($hostGroups.Count){"Найдено адресов: $($hostGroups.Count). Выберите устаревший Host и введите новый."}else{'В Host DB нет адресов моделей.'};$script:hostTest=$null
   $c.SummaryText.Text="Моделей: $($models.Count); зависших: $stuck; повторных: $repeat; с ошибками: $bad; имён: $($script:analysis.ResolvedNames); Host DB: $($script:analysis.DatabaseIntegrity); Status DB: $($script:analysis.StatusDatabaseIntegrity); журнал: $($script:analysis.HistoryStatus)"
-  $c.StatusText.Text='Проверка завершена. Зависшие модели подняты вверх списка.'
+  $c.StatusText.Text="Обновлено: $(Get-Date -Format HH:mm:ss). Автообновление каждые 5 с после завершения чтения."
+  $script:liveTimer.Start()
   Update-Buttons
 }
 function Get-StuckCount{@($script:analysis.Models|Where-Object{$_.Status -eq 'ЗАВИСАНИЕ'}).Count}
 function Refresh-Analysis{
   # Then вызывается после успешного чтения — для итогового текста после ремонта.
-  param([scriptblock]$Then,$ThenContext)
-  $instance=$c.InstanceCombo.SelectedItem;if($null-eq$instance){return}
-  Start-SynxJob -Title 'Чтение AutoSyncLog и SQLite-баз...' -Arguments @{Instance=$instance} -Context @{Then=$Then;Context=$ThenContext} -Work {
+  param([scriptblock]$Then,$ThenContext,[switch]$Background)
+  $instance=$c.InstanceCombo.SelectedItem;if(($null-eq$instance)-or($null-ne$script:job)){return}
+  $script:liveTimer.Stop()
+  Start-SynxJob -Background:$Background -Title 'Чтение AutoSyncLog и SQLite-баз...' -Arguments @{Instance=$instance} -Context @{Then=$Then;Context=$ThenContext;Background=[bool]$Background} -Work {
     param($Instance,$Progress)
     $analysis=Get-AcceleratorInventory $Instance -ProgressCallback $Progress
     & $Progress 96 'Группировка адресов Host'
     $hosts=@(Get-SynxHostAddressSummary $Instance)
     # Фильтр и сортировка событий здесь, а не в UI-потоке: их десятки тысяч.
     & $Progress 98 'Подготовка списка ошибок'
-    $visible=@($analysis.Events|Where-Object{($null-ne$_)-and($_.Level-in@('FAIL','WARN'))}|Sort-Object Time -Descending)
+    $visible=@($analysis.Events|Where-Object{($null-ne$_)-and($_.Level-in@('FAIL','WARN','OK'))}|Sort-Object Time -Descending)
     [pscustomobject]@{Analysis=$analysis;Hosts=$hosts;VisibleEvents=$visible}
   } -OnDone {
     param($Result,$ErrorText,$Context)
-    if($ErrorText){$c.StatusText.Text='Ошибка проверки';Show-Error $ErrorText;return}
+    if($ErrorText){$c.StatusText.Text="Ошибка обновления: $ErrorText";if($Context.Background){$script:liveTimer.Start()}else{Show-Error $ErrorText};return}
     Show-Analysis $Result
     if($Context.Then){& $Context.Then $Context.Context}
   }
 }
 
-$c.InstanceCombo.Add_SelectionChanged({$script:analysis=$null;$script:hostTest=$null;$script:lastDiagnosticPath='';$c.ModelsGrid.ItemsSource=$null;$c.ErrorsGrid.ItemsSource=$null;$c.OldHostCombo.ItemsSource=$null;$c.ModelsTab.Header='Модели';$c.ErrorsTab.Header='Ошибки AutoSync';Set-DiagnosisPanel $null '' '' '' '';Update-Buttons})
+$script:liveTimer=New-Object Windows.Threading.DispatcherTimer
+$script:liveTimer.Interval=[TimeSpan]::FromSeconds(5)
+$script:liveTimer.Add_Tick({if(($null-eq$script:job)-and($null-ne$script:analysis)){Refresh-Analysis -Background}})
+$window.Add_Closed({$script:liveTimer.Stop();$script:timer.Stop()})
+$c.InstanceCombo.Add_SelectionChanged({$script:liveTimer.Stop();$script:analysis=$null;$script:hostTest=$null;$script:lastDiagnosticPath='';$c.ModelsGrid.ItemsSource=$null;$c.ErrorsGrid.ItemsSource=$null;$c.OldHostCombo.ItemsSource=$null;$c.ModelsTab.Header='Модели';$c.ErrorsTab.Header='Ошибки AutoSync';Set-DiagnosisPanel $null '' '' '' '';Update-Buttons})
 $c.RefreshButton.Add_Click({Refresh-Analysis})
 $c.ModelsGrid.Add_SelectionChanged({$m=$c.ModelsGrid.SelectedItem;$script:lastDiagnosticPath='';Update-Buttons;if($null-eq$m){$c.SelectedText.Text='Выберите строку слева';Set-DiagnosisPanel $null '' '' '' '';return};$repeatText=if($m.RepeatFailure){'ДА — GUID снова упал после ремонта'}else{'нет'};$c.SelectedText.Text="Имя: $($m.Name)`nПуть модели: $($m.ModelPath)`nGUID: $($m.Guid)`nHost: $($m.HostNode)`nСостояние: $($m.Status)`nПовтор после ремонта: $repeatText`nСлучаев: $($m.IncidentCount); ремонтов: $($m.RepairCount)`nЗависаний: $($m.HangCount)`nКаталог: $($m.CachePath)";Set-DiagnosisPanel $m $m.Diagnosis $m.DiagnosisConfidence $m.DiagnosisEvidence $m.DiagnosisAction})
 $c.LoadNamesButton.Add_Click({$instance=$c.InstanceCombo.SelectedItem;if($null-eq$instance){return};$dialog=New-Object Microsoft.Win32.OpenFileDialog;$dialog.Title='Выберите ModelLocationTable.db3 с Revit Server Host';$dialog.Filter='ModelLocationTable.db3|ModelLocationTable.db3|SQLite (*.db3)|*.db3';if($dialog.ShowDialog($window)){$instance.LocationDatabases=@(@($instance.LocationDatabases)+$dialog.FileName|Sort-Object -Unique);Refresh-Analysis}})
@@ -202,8 +216,7 @@ $c.BatchRepairButton.Add_Click({
     $total=@($Models).Count
     for($i=0;$i -lt $total;$i++){
       $model=$Models[$i];$number=$i+1;$label=if($model.Name -and $model.Name -ne '—'){$model.Name}else{$model.Guid}
-      # $i, $number, $label и $Progress берутся из этой области при вызове из модуля.
-      $step={param($percent,$text)& $Progress ([Math]::Min(100,[int](($i*100+$percent)/$total))) "[$number/$total] $label — $text"}
+      $step={param($percent,$text)& $Progress ([Math]::Min(100,[int](($i*100+$percent)/$total))) "[$number/$total] $label — $text"}.GetNewClosure()
       try{[void](Invoke-AcceleratorModelRepair $model -ProgressCallback $step -Confirm:$false)}catch{throw "Пакетный ремонт остановлен на модели $number из $total ($label): $($_.Exception.Message)"}
     }
     $total
