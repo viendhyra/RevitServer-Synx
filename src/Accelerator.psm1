@@ -107,9 +107,22 @@ function Clear-SynxAutoSyncLogs {
     param([Parameter(Mandatory)]$Instance,[scriptblock]$ProgressCallback)
     if(-not(Test-SynxAdministrator)){throw 'Для очистки AutoSyncLog нужны права администратора.'}
     $paths=@(Find-AutoSyncLogs -Root $Instance.Root | Sort-Object -Unique)
+    $paths=@($paths|Where-Object{$PSCmdlet.ShouldProcess($_,'Остановить AutoSync, очистить лог и вернуть службу в исходное состояние')})
+    if(-not$paths.Count){return [pscustomobject]@{ClearedCount=0}}
+    $targets=Get-AcceleratorRepairTargets ([pscustomobject]@{Year=$Instance.Year;InstanceRoot=$Instance.Root})
+    if(-not$targets.Services.Count){throw 'Служба AutoSync выбранного экземпляра не найдена. Логи не изменены.'}
+    $restart=@()
     $cleared=0;$problems=@()
+    try{
+    foreach($service in $targets.Services){
+        if([string](Get-Service -Name $service.Name -ErrorAction Stop).Status-ne'Stopped'){
+            $restart+=,$service.Name
+            if($ProgressCallback){& $ProgressCallback 5 "Остановка AutoSync: $($service.Name)"}
+            Stop-Service -Name $service.Name -ErrorAction Stop
+            Wait-SynxServiceState $service.Name 'Stopped'
+        }
+    }
     foreach($path in $paths){
-        if(-not$PSCmdlet.ShouldProcess($path,'Очистить AutoSyncLog без удаления файла')){continue}
         $stream=$null
         try{
             $stream=[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Write,([IO.FileShare]::ReadWrite-bor[IO.FileShare]::Delete))
@@ -117,6 +130,13 @@ function Clear-SynxAutoSyncLogs {
         }catch{$problems+=,"${path}: $($_.Exception.Message)"}
         finally{if($stream){$stream.Dispose()}}
         if($ProgressCallback){& $ProgressCallback ([int](100*$cleared/[Math]::Max(1,$paths.Count))) "Очищено логов: $cleared из $($paths.Count)"}
+    }
+    }catch{$problems+=,$_.Exception.Message}
+    finally{
+        foreach($name in $restart){
+            try{Start-Service -Name $name -ErrorAction Stop;Wait-SynxServiceState $name 'Running'}
+            catch{$problems+=,"Не удалось запустить AutoSync ${name}: $($_.Exception.Message)"}
+        }
     }
     if($problems.Count){throw "Очищено логов: $cleared из $($paths.Count). Не удалось очистить:`n$($problems-join"`n")"}
     [pscustomobject]@{ClearedCount=$cleared}

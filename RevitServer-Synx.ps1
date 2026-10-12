@@ -151,7 +151,7 @@ $c.InstanceCombo.Add_SelectionChanged({$script:liveTimer.Stop();if($script:job -
 $c.RefreshButton.Add_Click({Refresh-Analysis})
 $c.ClearLogButton.Add_Click({
   $instance=$c.InstanceCombo.SelectedItem;if($null-eq$instance){return}
-  if(-not(Confirm-Action "Очистить все AutoSyncLog выбранного экземпляра $($instance.Name)?`n`nСтарые записи будут удалены безвозвратно. Файлы останутся; AutoSync продолжит писать новые события. Журнал Synx сохраняется." 'Очистка AutoSyncLog')){return}
+  if(-not(Confirm-Action "Очистить все AutoSyncLog выбранного экземпляра $($instance.Name)?`n`nСтарые записи будут удалены безвозвратно. Файлы останутся. AutoSync будет кратковременно остановлен для освобождения логов и запущен обратно. Синхронизация на это время приостановится. Журнал Synx сохраняется." 'Очистка AutoSyncLog')){return}
   Start-SynxJob -Critical -Title 'Очистка AutoSyncLog...' -Arguments @{Instance=$instance} -Work {
     param($Instance,$Progress)
     Clear-SynxAutoSyncLogs -Instance $Instance -ProgressCallback $Progress -Confirm:$false
