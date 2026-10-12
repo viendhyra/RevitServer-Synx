@@ -23,4 +23,13 @@ function Get-SynxHostAddressSummary {param($Instance) @()}
 $result=& $script:captured.Work $c.InstanceCombo.SelectedItem {param($Percent,$Text)}
 if(@($result.VisibleEvents).Count-ne2){throw 'Both completed syncs and failures must be visible.'}
 [xml]$xaml=[IO.File]::ReadAllText((Join-Path $PSScriptRoot '../ui/MainWindow.xaml'))
+$start=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name-eq'Start-SynxJob'},$true)
+Invoke-Expression $start.Extent.Text
+function Update-Buttons {}
+$fakePS=[pscustomobject]@{Stopped=$false}
+$fakePS | Add-Member ScriptMethod BeginStop {param($Callback,$State) $this.Stopped=$true;[pscustomobject]@{IsCompleted=$false}}
+$script:job=[pscustomobject]@{Background=$true;Cancelled=$false;PS=$fakePS;StopHandle=$null}
+$script:pendingJob=$null
+Start-SynxJob -Title 'Repair' -Critical -Arguments @{Model='selected'} -Work {} -OnDone {}
+if(-not$fakePS.Stopped-or-not$script:job.Cancelled-or$script:pendingJob.Title-ne'Repair'-or-not$script:pendingJob.Critical){throw 'Manual actions must cancel background reading asynchronously and retain the requested job.'}
 'Live refresh checks passed.'

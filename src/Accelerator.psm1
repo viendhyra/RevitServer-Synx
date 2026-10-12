@@ -102,6 +102,26 @@ function Get-AutoSyncLogAnalysis {
     };@($events)
 }
 
+function Clear-SynxAutoSyncLogs {
+    [CmdletBinding(SupportsShouldProcess=$true,ConfirmImpact='High')]
+    param([Parameter(Mandatory)]$Instance,[scriptblock]$ProgressCallback)
+    if(-not(Test-SynxAdministrator)){throw 'Для очистки AutoSyncLog нужны права администратора.'}
+    $paths=@(Find-AutoSyncLogs -Root $Instance.Root | Sort-Object -Unique)
+    $cleared=0;$problems=@()
+    foreach($path in $paths){
+        if(-not$PSCmdlet.ShouldProcess($path,'Очистить AutoSyncLog без удаления файла')){continue}
+        $stream=$null
+        try{
+            $stream=[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Write,([IO.FileShare]::ReadWrite-bor[IO.FileShare]::Delete))
+            $stream.SetLength(0);$cleared++
+        }catch{$problems+=,"${path}: $($_.Exception.Message)"}
+        finally{if($stream){$stream.Dispose()}}
+        if($ProgressCallback){& $ProgressCallback ([int](100*$cleared/[Math]::Max(1,$paths.Count))) "Очищено логов: $cleared из $($paths.Count)"}
+    }
+    if($problems.Count){throw "Очищено логов: $cleared из $($paths.Count). Не удалось очистить:`n$($problems-join"`n")"}
+    [pscustomobject]@{ClearedCount=$cleared}
+}
+
 function Find-AutoSyncLogs {
     param([Parameter(Mandatory)][string]$Root)
     $result=New-Object Collections.ArrayList
@@ -1027,4 +1047,4 @@ function Invoke-SynxFullCacheClear {
     }
 }
 
-Export-ModuleMember -Function Invoke-SynxFullCacheClear,Wait-SynxAppPoolStopped,Get-SynxPoolShutdownLimit,New-SynxStepReporter,Get-SynxModelStatus,Restore-SynxDatabaseSet,Get-SynxAppPoolInventory,Select-SynxRepairPools,Get-SynxPoolNameFromCommandLine,Get-SynxPoolWorkerProcesses,Initialize-SynxSqlite,Invoke-SynxSqliteQuery,Invoke-SynxSqliteExecute,Get-SynxSqliteIntegrity,ConvertFrom-AutoSyncLogLine,Get-AutoSyncLogAnalysis,Find-AutoSyncLogs,Get-RevitAcceleratorInstances,ConvertFrom-SynxGuidHex,Get-SynxModelLocationMap,Split-SynxHostNode,Get-SynxHostAddressSummary,Test-SynxHostEndpoint,Import-SynxHostModelNames,Test-SynxCacheFiles,Get-SynxGuidLogContext,Test-SynxModelDiagnostics,Get-SynxHistoryPath,Read-SynxIncidentHistory,Write-SynxIncidentHistory,Get-SynxLatestRepairTime,Get-SynxModelEventState,Get-AcceleratorInventory,Test-SynxAdministrator,ConvertTo-SynxAppPoolState,Get-SynxWebAppPoolState,Get-AcceleratorRepairTargets,New-AcceleratorRepairPreview,Stop-SynxLingeringPoolWorkers,Set-SynxCacheRepairAccess,Move-SynxCacheDirectory,Invoke-AcceleratorModelRepair,Invoke-SynxHostAddressMigration
+Export-ModuleMember -Function Clear-SynxAutoSyncLogs,Invoke-SynxFullCacheClear,Wait-SynxAppPoolStopped,Get-SynxPoolShutdownLimit,New-SynxStepReporter,Get-SynxModelStatus,Restore-SynxDatabaseSet,Get-SynxAppPoolInventory,Select-SynxRepairPools,Get-SynxPoolNameFromCommandLine,Get-SynxPoolWorkerProcesses,Initialize-SynxSqlite,Invoke-SynxSqliteQuery,Invoke-SynxSqliteExecute,Get-SynxSqliteIntegrity,ConvertFrom-AutoSyncLogLine,Get-AutoSyncLogAnalysis,Find-AutoSyncLogs,Get-RevitAcceleratorInstances,ConvertFrom-SynxGuidHex,Get-SynxModelLocationMap,Split-SynxHostNode,Get-SynxHostAddressSummary,Test-SynxHostEndpoint,Import-SynxHostModelNames,Test-SynxCacheFiles,Get-SynxGuidLogContext,Test-SynxModelDiagnostics,Get-SynxHistoryPath,Read-SynxIncidentHistory,Write-SynxIncidentHistory,Get-SynxLatestRepairTime,Get-SynxModelEventState,Get-AcceleratorInventory,Test-SynxAdministrator,ConvertTo-SynxAppPoolState,Get-SynxWebAppPoolState,Get-AcceleratorRepairTargets,New-AcceleratorRepairPreview,Stop-SynxLingeringPoolWorkers,Set-SynxCacheRepairAccess,Move-SynxCacheDirectory,Invoke-AcceleratorModelRepair,Invoke-SynxHostAddressMigration

@@ -1,11 +1,11 @@
-$ErrorActionPreference='Stop'
+﻿$ErrorActionPreference='Stop'
 $tokens=$null;$errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot '../RevitServer-Synx.ps1'),[ref]$tokens,[ref]$errors)
 if($errors.Count){throw ($errors.Message -join "`n")}
 $update=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Update-Buttons'},$true)
 Invoke-Expression $update.Extent.Text
 $c=@{}
-foreach($name in @('RefreshButton','InstanceCombo','LoadNamesButton','LoadHostNamesButton','TestHostButton','OldHostCombo','NewHostText','ModelsGrid','RepairButton','CacheCheckButton','OpenCacheButton','BatchRepairButton','MigrateHostButton','ClearCacheButton','OpenHistoryButton','OpenDiagnosticButton')){
+foreach($name in @('RefreshButton','InstanceCombo','LoadNamesButton','LoadHostNamesButton','TestHostButton','OldHostCombo','NewHostText','ModelsGrid','RepairButton','CacheCheckButton','OpenCacheButton','BatchRepairButton','MigrateHostButton','ClearCacheButton','ClearLogButton','OpenHistoryButton','OpenDiagnosticButton')){
     $c[$name]=[pscustomobject]@{IsEnabled=$false;SelectedItem=$null;Text=''}
 }
 $script:job=$null;$script:analysis=$null;$script:lastDiagnosticPath='';$isAdmin=$true
@@ -24,4 +24,10 @@ $c.OldHostCombo.SelectedItem=[pscustomobject]@{Address='old.example'};$isAdmin=$
 if($c.MigrateHostButton.IsEnabled){throw 'Migration requires administrator privileges.'}
 $isAdmin=$true;$script:job=[pscustomobject]@{};Update-Buttons
 if($c.MigrateHostButton.IsEnabled){throw 'Migration must be disabled while a job is running.'}
+$script:job=[pscustomobject]@{Background=$true;Cancelled=$false};Update-Buttons
+foreach($name in @('RefreshButton','InstanceCombo','LoadNamesButton','LoadHostNamesButton','TestHostButton','OldHostCombo','NewHostText','ModelsGrid','MigrateHostButton','ClearCacheButton')){
+    if(-not$c[$name].IsEnabled){throw "Background monitoring must not disable $name."}
+}
+$script:job.Cancelled=$true;Update-Buttons
+if($c.MigrateHostButton.IsEnabled){throw 'Actions must wait for cancellation before starting.'}
 'Host migration UI checks passed.'

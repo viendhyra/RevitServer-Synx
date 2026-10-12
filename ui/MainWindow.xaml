@@ -65,6 +65,7 @@
           <Button x:Name="RefreshButton" Style="{StaticResource PrimaryButton}" Content="Прочитать логи и базы"/>
           <Button x:Name="LoadNamesButton" Style="{StaticResource SecondaryButton}" Content="База имён..."/>
           <Button x:Name="OpenLogButton" Style="{StaticResource SecondaryButton}" Content="AutoSyncLog"/>
+          <Button x:Name="ClearLogButton" Style="{StaticResource DangerOutlineButton}" Content="Очистить AutoSyncLog..." IsEnabled="False"/>
           <Button x:Name="OpenHistoryButton" Style="{StaticResource SecondaryButton}" Content="Журнал Synx" IsEnabled="False"/>
           <Border Style="{StaticResource Divider}"/>
           <Button x:Name="ClearCacheButton" Style="{StaticResource DangerOutlineButton}" Content="Очистить весь кэш..." IsEnabled="False" ToolTip="Весь кэш экземпляра перемещается в SynxQuarantine с остановкой AutoSync/IIS; создаётся Rollback.ps1"/>

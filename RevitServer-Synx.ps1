@@ -4,7 +4,7 @@ Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase
 $modulePath=Join-Path $PSScriptRoot 'src\Accelerator.psm1'
 Import-Module $modulePath -Force
 $xamlPath=Join-Path $PSScriptRoot 'ui\MainWindow.xaml';[xml]$xaml=[IO.File]::ReadAllText($xamlPath,[Text.Encoding]::UTF8);$reader=New-Object Xml.XmlNodeReader $xaml;$window=[Windows.Markup.XamlReader]::Load($reader)
-$names=@('AdminStatusText','InstanceCombo','RefreshButton','SummaryText','LoadNamesButton','OpenLogButton','OpenHistoryButton','ClearCacheButton','OldHostCombo','NewHostText','TestHostButton','MigrateHostButton','LoadHostNamesButton','HostStatusText','ModelsGrid','ErrorsGrid','SelectedText','DiagnosisCard','DiagnosisTitleText','DiagnosisConfidenceText','DiagnosisEvidenceText','DiagnosisActionText','RepairButton','BatchRepairButton','CacheCheckButton','OpenDiagnosticButton','OpenCacheButton','RepairStepText','RepairProgress','RepairDetails','StatusText','JobProgress','AdminBadge','ModelsTab','ErrorsTab','HostExpander');$c=@{}
+$names=@('AdminStatusText','InstanceCombo','RefreshButton','SummaryText','LoadNamesButton','OpenLogButton','ClearLogButton','OpenHistoryButton','ClearCacheButton','OldHostCombo','NewHostText','TestHostButton','MigrateHostButton','LoadHostNamesButton','HostStatusText','ModelsGrid','ErrorsGrid','SelectedText','DiagnosisCard','DiagnosisTitleText','DiagnosisConfidenceText','DiagnosisEvidenceText','DiagnosisActionText','RepairButton','BatchRepairButton','CacheCheckButton','OpenDiagnosticButton','OpenCacheButton','RepairStepText','RepairProgress','RepairDetails','StatusText','JobProgress','AdminBadge','ModelsTab','ErrorsTab','HostExpander');$c=@{}
 foreach($name in $names){$control=$window.FindName($name);if($null-eq$control){throw "Элемент интерфейса не найден: $name"};$c[$name]=$control}
 $script:job=$null;$script:batchLimit=5
 $isAdmin=Test-SynxAdministrator;$c.AdminStatusText.Text=if($isAdmin){'Администратор — ремонт доступен'}else{'Только просмотр — для ремонта нужны права администратора'};if(-not$isAdmin){$c.AdminBadge.Background='#78350F';$c.AdminStatusText.Foreground='#FEF3C7'};$script:instances=@();$script:analysis=$null;$script:hostTest=$null;$script:lastDiagnosticPath=''
@@ -21,16 +21,16 @@ function Set-DiagnosisPanel($Model,[string]$Reason,[string]$Confidence,[string]$
   if($Confidence-eq'Высокая'){$c.DiagnosisCard.Background='#FEF2F2';$c.DiagnosisCard.BorderBrush='#FCA5A5'}elseif($Confidence-eq'Средняя'){$c.DiagnosisCard.Background='#FFFBEB';$c.DiagnosisCard.BorderBrush='#FCD34D'}else{$c.DiagnosisCard.Background='#EFF6FF';$c.DiagnosisCard.BorderBrush='#93C5FD'}
 }
 function Update-Buttons{
-  $idle=$null-eq$script:job;$m=$c.ModelsGrid.SelectedItem
+  $idle=($null-eq$script:job)-or($script:job.Background-and-not$script:job.Cancelled);$m=$c.ModelsGrid.SelectedItem
   $exists=[bool](($null-ne$m)-and(Test-Path -LiteralPath $m.CachePath))
   foreach($name in @('RefreshButton','InstanceCombo','LoadNamesButton','LoadHostNamesButton','TestHostButton','OldHostCombo','NewHostText','ModelsGrid')){$c[$name].IsEnabled=$idle}
-  if($script:job -and $script:job.Background){$c.ModelsGrid.IsEnabled=$true}
   $stuck=0;if($null-ne$script:analysis){$stuck=@($script:analysis.Models|Where-Object{$_.Status-eq'ЗАВИСАНИЕ'}).Count}
   $c.RepairButton.IsEnabled=[bool]($idle-and$isAdmin-and($null-ne$m))
   $c.CacheCheckButton.IsEnabled=[bool]($idle-and$exists)
   $c.OpenCacheButton.IsEnabled=$exists
   $c.BatchRepairButton.IsEnabled=[bool]($idle-and$isAdmin-and($stuck-gt0))
   $c.MigrateHostButton.IsEnabled=[bool]($idle-and$isAdmin-and($null-ne$c.InstanceCombo.SelectedItem)-and($null-ne$c.OldHostCombo.SelectedItem)-and(-not[string]::IsNullOrWhiteSpace($c.NewHostText.Text)))
+  $c.ClearLogButton.IsEnabled=[bool]($idle-and$isAdmin-and($null-ne$c.InstanceCombo.SelectedItem))
   $c.ClearCacheButton.IsEnabled=[bool]($idle-and$isAdmin-and($null-ne$c.InstanceCombo.SelectedItem))
   $c.OpenHistoryButton.IsEnabled=[bool](($null-ne$script:analysis)-and(Test-Path -LiteralPath $script:analysis.HistoryPath -PathType Leaf))
   $c.OpenDiagnosticButton.IsEnabled=[bool]($script:lastDiagnosticPath-and(Test-Path -LiteralPath $script:lastDiagnosticPath -PathType Leaf))
@@ -52,13 +52,21 @@ $script:jobBootstrap={
 function Start-SynxJob{
   # Critical — работа меняет службы и файлы: окно нельзя закрыть, шаги пишутся в журнал ремонта.
   param([Parameter(Mandatory)][string]$Title,[Parameter(Mandatory)][scriptblock]$Work,[hashtable]$Arguments=@{},[Parameter(Mandatory)][scriptblock]$OnDone,$Context=$null,[switch]$Critical,[switch]$Background)
-  if($null-ne$script:job){return}
+  if($null-ne$script:job){
+    if($Background-or-not$script:job.Background-or$script:job.Cancelled){return}
+    # BeginStop не ждёт завершения чтения в UI-потоке.
+    $script:pendingJob=@{};foreach($key in $PSBoundParameters.Keys){$script:pendingJob[$key]=$PSBoundParameters[$key]}
+    $script:job.Cancelled=$true
+    $script:job.StopHandle=$script:job.PS.BeginStop($null,$null)
+    $c.StatusText.Text='Остановка автообновления перед выполнением действия...'
+    Update-Buttons;return
+  }
   $sync=[hashtable]::Synchronized(@{Percent=0;Text=$Title;Log=[Collections.ArrayList]::Synchronized((New-Object Collections.ArrayList));Result=$null;Error=$null})
   $ps=[PowerShell]::Create()
   [void]$ps.AddScript($script:jobBootstrap.ToString()).AddArgument($modulePath).AddArgument($sync).AddArgument($Work.ToString()).AddArgument($Arguments)
-  $script:job=[pscustomobject]@{PS=$ps;Handle=$null;Sync=$sync;OnDone=$OnDone;Context=$Context;Critical=[bool]$Critical;Background=[bool]$Background;LogIndex=0}
+  $script:job=[pscustomobject]@{PS=$ps;Handle=$null;Sync=$sync;OnDone=$OnDone;Context=$Context;Critical=[bool]$Critical;Background=[bool]$Background;Cancelled=$false;StopHandle=$null;LogIndex=0}
   $script:job.Handle=$ps.BeginInvoke()
-  $c.JobProgress.Value=0;$c.JobProgress.Visibility='Visible';$c.StatusText.Text=$Title
+  if(-not$Background){$c.JobProgress.Value=0;$c.JobProgress.Visibility='Visible';$c.StatusText.Text=$Title}
   if($Critical){$c.RepairProgress.Value=0;$c.RepairStepText.Text="0% — $Title";$c.RepairDetails.Clear()}
   Update-Buttons
   $script:timer.Start()
@@ -66,18 +74,24 @@ function Start-SynxJob{
 $script:timer=New-Object Windows.Threading.DispatcherTimer;$script:timer.Interval=[TimeSpan]::FromMilliseconds(150)
 $script:timer.Add_Tick({
   $j=$script:job;if($null-eq$j){$script:timer.Stop();return}
-  $finished=$j.Handle.IsCompleted
+  $finished=$j.Handle.IsCompleted-and(($null-eq$j.StopHandle)-or$j.StopHandle.IsCompleted)
   $s=$j.Sync;$percent=[int]$s.Percent;$text=[string]$s.Text
-  $c.JobProgress.Value=$percent;$c.StatusText.Text="$percent% — $text"
+  if(-not$j.Background){$c.JobProgress.Value=$percent;$c.StatusText.Text="$percent% — $text"}
   if($j.Critical){
     $c.RepairProgress.Value=$percent;$c.RepairStepText.Text="$percent% — $text"
     $count=$s.Log.Count;if($count-gt$j.LogIndex){for($k=$j.LogIndex;$k-lt$count;$k++){$c.RepairDetails.AppendText([string]$s.Log[$k]+"`r`n")};$j.LogIndex=$count;$c.RepairDetails.ScrollToEnd()}
   }
   if(-not$finished){return}
   $script:timer.Stop()
+  if($j.StopHandle){try{$j.PS.EndStop($j.StopHandle)}catch{}}
   try{[void]$j.PS.EndInvoke($j.Handle)}catch{if(-not$s.Error){$s.Error=$_.Exception.Message}}
   $j.PS.Dispose();$script:job=$null;$c.JobProgress.Visibility='Collapsed'
   Update-Buttons
+  if($j.Cancelled){
+    $pending=$script:pendingJob;$script:pendingJob=$null
+    if($pending){Start-SynxJob @pending}
+    return
+  }
   try{& $j.OnDone $s.Result $s.Error $j.Context}catch{Show-Error $_.Exception.Message}
 })
 $window.Add_Closing({param($sender,$e)
@@ -110,7 +124,7 @@ function Get-StuckCount{@($script:analysis.Models|Where-Object{$_.Status -eq 'З
 function Refresh-Analysis{
   # Then вызывается после успешного чтения — для итогового текста после ремонта.
   param([scriptblock]$Then,$ThenContext,[switch]$Background)
-  $instance=$c.InstanceCombo.SelectedItem;if(($null-eq$instance)-or($null-ne$script:job)){return}
+  $instance=$c.InstanceCombo.SelectedItem;if(($null-eq$instance)-or(($null-ne$script:job)-and($Background-or-not$script:job.Background))){return}
   $script:liveTimer.Stop()
   Start-SynxJob -Background:$Background -Title 'Чтение AutoSyncLog и SQLite-баз...' -Arguments @{Instance=$instance} -Context @{Then=$Then;Context=$ThenContext;Background=[bool]$Background} -Work {
     param($Instance,$Progress)
@@ -133,8 +147,20 @@ $script:liveTimer=New-Object Windows.Threading.DispatcherTimer
 $script:liveTimer.Interval=[TimeSpan]::FromSeconds(5)
 $script:liveTimer.Add_Tick({if(($null-eq$script:job)-and($null-ne$script:analysis)){Refresh-Analysis -Background}})
 $window.Add_Closed({$script:liveTimer.Stop();$script:timer.Stop()})
-$c.InstanceCombo.Add_SelectionChanged({$script:liveTimer.Stop();$script:analysis=$null;$script:hostTest=$null;$script:lastDiagnosticPath='';$c.ModelsGrid.ItemsSource=$null;$c.ErrorsGrid.ItemsSource=$null;$c.OldHostCombo.ItemsSource=$null;$c.ModelsTab.Header='Модели';$c.ErrorsTab.Header='Ошибки AutoSync';Set-DiagnosisPanel $null '' '' '' '';Update-Buttons})
+$c.InstanceCombo.Add_SelectionChanged({$script:liveTimer.Stop();if($script:job -and $script:job.Background -and -not$script:job.Cancelled){$script:job.Cancelled=$true;$script:job.StopHandle=$script:job.PS.BeginStop($null,$null)};$script:analysis=$null;$script:hostTest=$null;$script:lastDiagnosticPath='';$c.ModelsGrid.ItemsSource=$null;$c.ErrorsGrid.ItemsSource=$null;$c.OldHostCombo.ItemsSource=$null;$c.ModelsTab.Header='Модели';$c.ErrorsTab.Header='Ошибки AutoSync';Set-DiagnosisPanel $null '' '' '' '';Update-Buttons})
 $c.RefreshButton.Add_Click({Refresh-Analysis})
+$c.ClearLogButton.Add_Click({
+  $instance=$c.InstanceCombo.SelectedItem;if($null-eq$instance){return}
+  if(-not(Confirm-Action "Очистить все AutoSyncLog выбранного экземпляра $($instance.Name)?`n`nСтарые записи будут удалены безвозвратно. Файлы останутся; AutoSync продолжит писать новые события. Журнал Synx сохраняется." 'Очистка AutoSyncLog')){return}
+  Start-SynxJob -Critical -Title 'Очистка AutoSyncLog...' -Arguments @{Instance=$instance} -Work {
+    param($Instance,$Progress)
+    Clear-SynxAutoSyncLogs -Instance $Instance -ProgressCallback $Progress -Confirm:$false
+  } -OnDone {
+    param($Result,$ErrorText)
+    if($ErrorText){Show-Error $ErrorText;Refresh-Analysis;return}
+    Refresh-Analysis -ThenContext $Result -Then {param($r)$c.StatusText.Text="Очищено AutoSyncLog: $($r.ClearedCount). Отображаются новые события."}
+  }
+})
 $c.ModelsGrid.Add_SelectionChanged({$m=$c.ModelsGrid.SelectedItem;$script:lastDiagnosticPath='';Update-Buttons;if($null-eq$m){$c.SelectedText.Text='Выберите строку слева';Set-DiagnosisPanel $null '' '' '' '';return};$repeatText=if($m.RepeatFailure){'ДА — GUID снова упал после ремонта'}else{'нет'};$c.SelectedText.Text="Имя: $($m.Name)`nПуть модели: $($m.ModelPath)`nGUID: $($m.Guid)`nHost: $($m.HostNode)`nСостояние: $($m.Status)`nПовтор после ремонта: $repeatText`nСлучаев: $($m.IncidentCount); ремонтов: $($m.RepairCount)`nЗависаний: $($m.HangCount)`nКаталог: $($m.CachePath)";Set-DiagnosisPanel $m $m.Diagnosis $m.DiagnosisConfidence $m.DiagnosisEvidence $m.DiagnosisAction})
 $c.LoadNamesButton.Add_Click({$instance=$c.InstanceCombo.SelectedItem;if($null-eq$instance){return};$dialog=New-Object Microsoft.Win32.OpenFileDialog;$dialog.Title='Выберите ModelLocationTable.db3 с Revit Server Host';$dialog.Filter='ModelLocationTable.db3|ModelLocationTable.db3|SQLite (*.db3)|*.db3';if($dialog.ShowDialog($window)){$instance.LocationDatabases=@(@($instance.LocationDatabases)+$dialog.FileName|Sort-Object -Unique);Refresh-Analysis}})
 $c.OpenLogButton.Add_Click({$instance=$c.InstanceCombo.SelectedItem;if($null-ne$instance-and@($instance.LogPaths).Count){Start-Process notepad.exe -ArgumentList ('"'+$instance.LogPaths[0]+'"')}})
